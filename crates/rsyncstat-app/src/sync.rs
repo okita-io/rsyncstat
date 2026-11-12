@@ -167,6 +167,93 @@ pub fn compare_indexes(a: &HashMap<String, u64>, b: &HashMap<String, u64>) -> Co
     summary
 }
 
+/// One direct child of the two scan roots, included only when its sizes differ.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirDelta {
+    pub name: String,
+    pub bytes_a: u64,
+    pub bytes_b: u64,
+}
+
+impl DirDelta {
+    pub fn a_minus_b(&self) -> i128 {
+        self.bytes_a as i128 - self.bytes_b as i128
+    }
+}
+
+/// Byte difference between two scanned folders, checked against their children.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryDiff {
+    pub bytes_a: u64,
+    pub bytes_b: u64,
+    /// Differing top-level files and folders, largest absolute gap first.
+    pub entries: Vec<DirDelta>,
+    /// Sum of every direct child's (A − B) equals [`Self::bytes_a`] − [`Self::bytes_b`].
+    pub balanced: bool,
+}
+
+impl DirectoryDiff {
+    pub fn a_minus_b(&self) -> i128 {
+        self.bytes_a as i128 - self.bytes_b as i128
+    }
+}
+
+/// Compare the two scan roots by their direct children.
+///
+/// Equal children are omitted. `balanced` is true when those children, including
+/// the equal ones, account for the whole difference between the roots.
+pub fn directory_diff(a: &TreeNode, b: &TreeNode) -> DirectoryDiff {
+    let mut sizes_a: HashMap<&str, (u64, bool)> = HashMap::new();
+    let mut sizes_b: HashMap<&str, (u64, bool)> = HashMap::new();
+    for child in &a.children {
+        sizes_a.insert(child.name.as_str(), (child.total_size(), child.is_dir));
+    }
+    for child in &b.children {
+        sizes_b.insert(child.name.as_str(), (child.total_size(), child.is_dir));
+    }
+    let mut names: Vec<&str> = sizes_a.keys().copied().collect();
+    for name in sizes_b.keys() {
+        if !sizes_a.contains_key(name) {
+            names.push(name);
+        }
+    }
+    let mut child_net: i128 = 0;
+    let mut entries = Vec::new();
+    for name in names {
+        let (bytes_a, dir_a) = sizes_a.get(name).copied().unwrap_or((0, false));
+        let (bytes_b, dir_b) = sizes_b.get(name).copied().unwrap_or((0, false));
+        child_net += bytes_a as i128 - bytes_b as i128;
+        if bytes_a == bytes_b {
+            continue;
+        }
+        let name = if dir_a || dir_b {
+            format!("{name}/")
+        } else {
+            (*name).to_string()
+        };
+        entries.push(DirDelta {
+            name,
+            bytes_a,
+            bytes_b,
+        });
+    }
+    entries.sort_by(|left, right| {
+        right
+            .a_minus_b()
+            .unsigned_abs()
+            .cmp(&left.a_minus_b().unsigned_abs())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let bytes_a = a.total_size();
+    let bytes_b = b.total_size();
+    DirectoryDiff {
+        bytes_a,
+        bytes_b,
+        entries,
+        balanced: child_net == bytes_a as i128 - bytes_b as i128,
+    }
+}
+
 pub fn plan_sync(a: &TreeNode, b: &TreeNode, method: SyncMethod, rules: &SyncRules) -> SyncPlan {
     let (files_a, excluded_a) = collect_files(a, rules);
     let (files_b, excluded_b) = collect_files(b, rules);
@@ -455,6 +542,51 @@ mod tests {
         assert_eq!(match_file("same.txt", 10, &b), Some(MatchKind::Same));
         assert_eq!(match_file("diff.txt", 1, &b), Some(MatchKind::Different));
         assert_eq!(match_file("only_a.txt", 4, &b), None);
+    }
+
+    fn tree_with(files: &[(&str, u64)]) -> TreeNode {
+        let mut root = TreeNode::new_dir("root");
+        for (path, size) in files {
+            root.insert_scanned(std::path::Path::new(path), *size, false, false, None);
+        }
+        root
+    }
+
+    #[test]
+    fn directory_diff_lists_gaps_that_add_up() {
+        let a = tree_with(&[
+            ("keep/a.txt", 10),
+            ("bigger/a.txt", 100),
+            ("only_a/a.txt", 40),
+        ]);
+        let b = tree_with(&[
+            ("keep/a.txt", 10),
+            ("bigger/a.txt", 25),
+            ("only_b/b.txt", 7),
+        ]);
+        let diff = directory_diff(&a, &b);
+        assert_eq!(diff.bytes_a, 150);
+        assert_eq!(diff.bytes_b, 42);
+        assert_eq!(diff.a_minus_b(), 108);
+        assert!(diff.balanced);
+        assert_eq!(
+            diff.entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.a_minus_b()))
+                .collect::<Vec<_>>(),
+            vec![("bigger/", 75), ("only_a/", 40), ("only_b/", -7)]
+        );
+        let listed: i128 = diff.entries.iter().map(DirDelta::a_minus_b).sum();
+        assert_eq!(listed, diff.a_minus_b());
+    }
+
+    #[test]
+    fn directory_diff_is_empty_when_sizes_match() {
+        let tree = tree_with(&[("x/a.txt", 5)]);
+        let diff = directory_diff(&tree, &tree);
+        assert_eq!(diff.a_minus_b(), 0);
+        assert!(diff.entries.is_empty());
+        assert!(diff.balanced);
     }
 
     #[test]

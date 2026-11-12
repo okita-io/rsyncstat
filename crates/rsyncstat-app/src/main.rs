@@ -527,6 +527,41 @@ impl RsyncStatApp {
         active || self.syncing
     }
 
+    fn content_diff(&self) -> Option<sync::DirectoryDiff> {
+        if !self.dual_pane || self.source.scanning || self.target.scanning {
+            return None;
+        }
+        Some(sync::directory_diff(
+            self.source.tree.as_ref()?,
+            self.target.tree.as_ref()?,
+        ))
+    }
+
+    fn pane_space_tiles(&self, pane: ActivePane) -> Vec<volume::SpaceTile> {
+        let other = match pane {
+            ActivePane::Source => ActivePane::Target,
+            ActivePane::Target => ActivePane::Source,
+        };
+        let mut tiles = volume::space_tiles(
+            self.pane(pane).volume,
+            self.pane(other).volume,
+            self.dual_pane,
+        );
+        let both_drives = self.source.volume.is_some() && self.target.volume.is_some();
+        if self.dual_pane && !both_drives && !self.source.scanning && !self.target.scanning {
+            if let (Some(this), Some(that)) = (
+                self.pane(pane).tree.as_ref(),
+                self.pane(other).tree.as_ref(),
+            ) {
+                let gap = that.total_size().saturating_sub(this.total_size());
+                if gap > 0 {
+                    tiles.push(volume::SpaceTile::ContentGap(gap));
+                }
+            }
+        }
+        tiles
+    }
+
     fn hover_status(&self) -> Option<String> {
         if let Some(text) = self.source.space_hover.as_ref() {
             if self.source.hover_path.is_none() {
@@ -590,6 +625,7 @@ impl eframe::App for RsyncStatApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let content_diff = self.content_diff();
         egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Open source (A)…").clicked() {
@@ -652,6 +688,9 @@ impl eframe::App for RsyncStatApp {
                     compare.same, compare.different, compare.only_a, compare.only_b
                 ));
             }
+            if let Some(diff) = &content_diff {
+                ui.label(space_summary(diff));
+            }
             if let Some(plan) = &self.preview {
                 let stale = self.preview_key != self.rules_key();
                 let stale = if stale { " · preview out of date" } else { "" };
@@ -710,12 +749,7 @@ impl eframe::App for RsyncStatApp {
             ActivePane::Source => self.target.tree.is_some(),
             ActivePane::Target => self.source.tree.is_some(),
         };
-        let active_volume = self.pane(active).volume;
-        let other_volume = match active {
-            ActivePane::Source => self.target.volume,
-            ActivePane::Target => self.source.volume,
-        };
-        let space_tiles = volume::space_tiles(active_volume, other_volume, self.dual_pane);
+        let space_tiles = self.pane_space_tiles(active);
 
         egui::Panel::left("tree_panel")
             .resizable(true)
@@ -761,7 +795,7 @@ impl eframe::App for RsyncStatApp {
                             (&mut self.target.selected_path, &mut self.target.hover_path)
                         }
                     };
-                    let tree_height = (ui.available_height() - 150.0).max(120.0);
+                    let tree_height = (ui.available_height() - 320.0).max(100.0);
                     egui::ScrollArea::both()
                         .max_height(tree_height)
                         .show(ui, |ui| {
@@ -779,6 +813,15 @@ impl eframe::App for RsyncStatApp {
                     ui.label("Starting…");
                 } else {
                     ui.label("No scan data for this pane.");
+                }
+                ui.separator();
+                ui.heading("Size difference");
+                if let Some(diff) = &content_diff {
+                    ui::size_diff_view(ui, diff);
+                } else if self.dual_pane && (self.source.scanning || self.target.scanning) {
+                    ui.weak("Waiting for both scans to finish.");
+                } else {
+                    ui.weak("Open two folders to compare their size.");
                 }
                 ui.separator();
                 ui.heading("File types");
@@ -901,14 +944,7 @@ impl RsyncStatApp {
             ActivePane::Source => self.target.tree.is_some(),
             ActivePane::Target => self.source.tree.is_some(),
         };
-        let space_tiles = volume::space_tiles(
-            self.pane(pane).volume,
-            match pane {
-                ActivePane::Source => self.target.volume,
-                ActivePane::Target => self.source.volume,
-            },
-            self.dual_pane,
-        );
+        let space_tiles = self.pane_space_tiles(pane);
 
         if let Some(ref t) = tree {
             let (selected, hover, space_hover) = match pane {
@@ -968,6 +1004,27 @@ fn find_by_path<'a>(root: &'a TreeNode, path: &[String]) -> Option<&'a TreeNode>
         node = node.child(part)?;
     }
     Some(node)
+}
+
+fn space_summary(diff: &sync::DirectoryDiff) -> String {
+    let net = diff.a_minus_b();
+    let relation = if net > 0 {
+        format!("A is {} larger", format_bytes(net as u64))
+    } else if net < 0 {
+        format!("B is {} larger", format_bytes((-net) as u64))
+    } else {
+        "same size".to_string()
+    };
+    let check = if diff.balanced {
+        ""
+    } else {
+        " · child sizes do not add up"
+    };
+    format!(
+        "Space: A {} · B {} · {relation}{check}",
+        format_bytes(diff.bytes_a),
+        format_bytes(diff.bytes_b)
+    )
 }
 
 fn format_bytes(n: u64) -> String {

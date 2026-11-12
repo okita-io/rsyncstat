@@ -19,12 +19,14 @@ pub enum SpaceTile {
     Free(u64),
     /// This volume's capacity is smaller than the other drive by this many bytes.
     Gap(u64),
+    /// This scanned folder holds fewer bytes than the other folder.
+    ContentGap(u64),
 }
 
 impl SpaceTile {
     pub fn bytes(self) -> u64 {
         match self {
-            SpaceTile::Free(bytes) | SpaceTile::Gap(bytes) => bytes,
+            SpaceTile::Free(bytes) | SpaceTile::Gap(bytes) | SpaceTile::ContentGap(bytes) => bytes,
         }
     }
 }
