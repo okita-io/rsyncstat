@@ -1,5 +1,6 @@
 //! RSyncStat M0/M1 UI: dual-root treemap comparison.
 
+mod keyboard;
 mod sync;
 mod ui;
 mod volume;
@@ -320,6 +321,7 @@ struct RsyncStatApp {
     sync_status: String,
     /// Tail of the recovery log for the current sync (also written to disk).
     recovery_lines: Vec<String>,
+    kbd: keyboard::KeyboardState,
 }
 
 impl RsyncStatApp {
@@ -345,7 +347,132 @@ impl RsyncStatApp {
             dest_refresh_at: None,
             sync_status: "Sync copies files. It does not delete extras.".to_string(),
             recovery_lines: Vec::new(),
+            kbd: keyboard::KeyboardState::default(),
         }
+    }
+
+    fn apply_keyboard_action(&mut self, action: keyboard::KeyAction) {
+        use keyboard::FocusId;
+        match action {
+            keyboard::KeyAction::None => {}
+            keyboard::KeyAction::OpenFolder(pane) => self.pick_folder(pane),
+            keyboard::KeyAction::Rescan(pane) => {
+                if let Some(path) = self.pane(pane).root.clone() {
+                    self.start_scan(pane, path);
+                }
+            }
+            keyboard::KeyAction::ToggleDualPane => self.dual_pane = !self.dual_pane,
+            keyboard::KeyAction::ToggleMnemonicVis => {
+                self.kbd.mnemonic_vis = match self.kbd.mnemonic_vis {
+                    keyboard::MnemonicVisibility::Always => {
+                        keyboard::MnemonicVisibility::WhenAltHeld
+                    }
+                    keyboard::MnemonicVisibility::WhenAltHeld => {
+                        keyboard::MnemonicVisibility::Always
+                    }
+                };
+            }
+            keyboard::KeyAction::SetActivePane(pane) => self.active_pane = pane,
+            keyboard::KeyAction::FocusTreeTab(pane) => {
+                self.active_pane = pane;
+                self.kbd.focused = match pane {
+                    ActivePane::Source => FocusId::TreeTabA,
+                    ActivePane::Target => FocusId::TreeTabB,
+                };
+            }
+            keyboard::KeyAction::TreemapParent(pane) => {
+                let state = self.pane_mut(pane);
+                keyboard::treemap_nav_parent(&mut state.selected_path);
+            }
+            keyboard::KeyAction::TreemapChild(pane) => {
+                if let Some(tree) = self.pane(pane).tree.clone() {
+                    let state = self.pane_mut(pane);
+                    keyboard::treemap_nav_child(&tree, &mut state.selected_path);
+                }
+            }
+            keyboard::KeyAction::RefreshCompare => {
+                self.compare_dirty = true;
+                self.refresh_compare();
+            }
+            keyboard::KeyAction::StartSync => {
+                if !self.syncing && self.folders_idle() {
+                    self.start_sync();
+                }
+            }
+            keyboard::KeyAction::ApplyExcludes => {
+                if !self.syncing {
+                    self.apply_excludes();
+                }
+            }
+            keyboard::KeyAction::CancelScan(pane) => {
+                if let Some(cancel) = self.pane(pane).cancel.clone() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            keyboard::KeyAction::CancelSync => {
+                if let Some(cancel) = self.sync_cancel.clone() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            keyboard::KeyAction::ActivateFocused => self.activate_focused_control(),
+            keyboard::KeyAction::ToggleHelp => self.kbd.help_open = !self.kbd.help_open,
+        }
+    }
+
+    fn activate_focused_control(&mut self) {
+        use keyboard::{raw_label_for, FocusId};
+        let slot = self.kbd.focused;
+        match slot {
+            FocusId::OpenSourceA => self.pick_folder(ActivePane::Source),
+            FocusId::OpenTargetB => self.pick_folder(ActivePane::Target),
+            FocusId::DualPane => self.dual_pane = !self.dual_pane,
+            FocusId::MnemonicVisToggle => {
+                self.kbd.mnemonic_vis = match self.kbd.mnemonic_vis {
+                    keyboard::MnemonicVisibility::Always => {
+                        keyboard::MnemonicVisibility::WhenAltHeld
+                    }
+                    keyboard::MnemonicVisibility::WhenAltHeld => {
+                        keyboard::MnemonicVisibility::Always
+                    }
+                };
+            }
+            FocusId::ApplyRescan => {
+                if !self.syncing {
+                    self.apply_excludes();
+                }
+            }
+            FocusId::RunSync => {
+                if !self.syncing && self.folders_idle() {
+                    self.start_sync();
+                }
+            }
+            FocusId::TreeTabA => self.active_pane = ActivePane::Source,
+            FocusId::TreeTabB => self.active_pane = ActivePane::Target,
+            FocusId::PaneAChoose => self.pick_folder(ActivePane::Source),
+            FocusId::PaneBChoose => self.pick_folder(ActivePane::Target),
+            FocusId::PaneARescan => {
+                if let Some(path) = self.source.root.clone() {
+                    self.start_scan(ActivePane::Source, path);
+                }
+            }
+            FocusId::PaneBRescan => {
+                if let Some(path) = self.target.root.clone() {
+                    self.start_scan(ActivePane::Target, path);
+                }
+            }
+            FocusId::SyncMethod
+            | FocusId::ExcludeTypes
+            | FocusId::ExcludeDirs
+            | FocusId::DirectoryTree
+            | FocusId::TreemapA
+            | FocusId::TreemapB
+            | FocusId::Splitter => {}
+        }
+        let _ = raw_label_for(slot);
+    }
+
+    fn paint_focus_if(&self, ui: &egui::Ui, rect: egui::Rect, slot: keyboard::FocusId) {
+        keyboard::paint_focus_ring(ui, rect, keyboard::is_focused(&self.kbd, slot));
     }
 
     fn push_recovery(&mut self, line: String) {
@@ -875,20 +1002,73 @@ impl RsyncStatApp {
 impl eframe::App for RsyncStatApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scans(ctx);
+        keyboard::handle_frame_input(
+            ctx,
+            &mut self.kbd,
+            self.dual_pane,
+            self.active_pane,
+            self.source.scanning,
+            self.target.scanning,
+            self.syncing,
+        );
+        let action = keyboard::take_pending(&mut self.kbd);
+        self.apply_keyboard_action(action);
+        keyboard::draw_help_window(ctx, &mut self.kbd.help_open);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let content_diff = self.content_diff();
+        let show_mnemonic = keyboard::show_mnemonic_underlines(&self.kbd, ui.ctx());
         egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Open source (A)…").clicked() {
+                let r = keyboard::mnemonic_button(
+                    ui,
+                    keyboard::FocusId::OpenSourceA,
+                    keyboard::raw_label_for(keyboard::FocusId::OpenSourceA),
+                    show_mnemonic,
+                );
+                self.paint_focus_if(ui, r.rect, keyboard::FocusId::OpenSourceA);
+                if r.clicked() {
                     self.pick_folder(ActivePane::Source);
                 }
-                if ui.button("Open target (B)…").clicked() {
-                    self.pick_folder(ActivePane::Target);
+                if self.dual_pane {
+                    let r = keyboard::mnemonic_button(
+                        ui,
+                        keyboard::FocusId::OpenTargetB,
+                        keyboard::raw_label_for(keyboard::FocusId::OpenTargetB),
+                        show_mnemonic,
+                    );
+                    self.paint_focus_if(ui, r.rect, keyboard::FocusId::OpenTargetB);
+                    if r.clicked() {
+                        self.pick_folder(ActivePane::Target);
+                    }
                 }
                 ui.separator();
-                ui.checkbox(&mut self.dual_pane, "Side-by-side A | B");
+                let r = keyboard::mnemonic_checkbox(
+                    ui,
+                    keyboard::FocusId::DualPane,
+                    keyboard::raw_label_for(keyboard::FocusId::DualPane),
+                    &mut self.dual_pane,
+                    show_mnemonic,
+                );
+                self.paint_focus_if(ui, r.rect, keyboard::FocusId::DualPane);
+                let mut underline_always =
+                    matches!(self.kbd.mnemonic_vis, keyboard::MnemonicVisibility::Always);
+                let r = keyboard::mnemonic_checkbox(
+                    ui,
+                    keyboard::FocusId::MnemonicVisToggle,
+                    keyboard::raw_label_for(keyboard::FocusId::MnemonicVisToggle),
+                    &mut underline_always,
+                    show_mnemonic,
+                );
+                self.paint_focus_if(ui, r.rect, keyboard::FocusId::MnemonicVisToggle);
+                if r.changed() {
+                    self.kbd.mnemonic_vis = if underline_always {
+                        keyboard::MnemonicVisibility::Always
+                    } else {
+                        keyboard::MnemonicVisibility::WhenAltHeld
+                    };
+                }
                 ui.separator();
                 ui.colored_label(egui::Color32::from_rgb(90, 220, 130), "■");
                 ui.label("same file");
@@ -898,41 +1078,97 @@ impl eframe::App for RsyncStatApp {
                 ui.weak("Names and sizes appear on hover.");
             });
             ui.horizontal_wrapped(|ui| {
-                ui.label("Sync");
-                egui::ComboBox::from_id_salt("sync_method")
-                    .selected_text(self.sync_method.label())
-                    .show_ui(ui, |ui| {
-                        for method in SyncMethod::all() {
-                            ui.selectable_value(&mut self.sync_method, method, method.label());
-                        }
-                    });
-                ui.label("Exclude types");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.exclude_types)
-                        .hint_text("log, tmp, jpg")
-                        .desired_width(150.0),
-                );
-                ui.label("Exclude dirs");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.exclude_dirs)
-                        .hint_text("node_modules, .git, target")
-                        .desired_width(190.0),
-                );
-                if ui
-                    .add_enabled(!self.syncing, egui::Button::new("Apply & rescan"))
-                    .clicked()
-                {
+                ui.label(keyboard::raw_label_for(keyboard::FocusId::SyncMethod));
+                let combo = egui::ComboBox::from_id_salt("sync_method")
+                    .selected_text(self.sync_method.label());
+                let combo_resp = ui
+                    .push_id(
+                        keyboard::focus_egui_id(keyboard::FocusId::SyncMethod),
+                        |ui| {
+                            combo
+                                .show_ui(ui, |ui| {
+                                    for method in SyncMethod::all() {
+                                        ui.selectable_value(
+                                            &mut self.sync_method,
+                                            method,
+                                            method.label(),
+                                        );
+                                    }
+                                })
+                                .response
+                        },
+                    )
+                    .inner;
+                self.paint_focus_if(ui, combo_resp.rect, keyboard::FocusId::SyncMethod);
+                ui.label(keyboard::raw_label_for(keyboard::FocusId::ExcludeTypes));
+                let types = ui
+                    .push_id(
+                        keyboard::focus_egui_id(keyboard::FocusId::ExcludeTypes),
+                        |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.exclude_types)
+                                    .hint_text("log, tmp, jpg")
+                                    .desired_width(150.0),
+                            )
+                        },
+                    )
+                    .inner;
+                self.paint_focus_if(ui, types.rect, keyboard::FocusId::ExcludeTypes);
+                ui.label(keyboard::raw_label_for(keyboard::FocusId::ExcludeDirs));
+                let dirs = ui
+                    .push_id(
+                        keyboard::focus_egui_id(keyboard::FocusId::ExcludeDirs),
+                        |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.exclude_dirs)
+                                    .hint_text("node_modules, .git, target")
+                                    .desired_width(190.0),
+                            )
+                        },
+                    )
+                    .inner;
+                self.paint_focus_if(ui, dirs.rect, keyboard::FocusId::ExcludeDirs);
+                let r = ui
+                    .push_id(
+                        keyboard::focus_egui_id(keyboard::FocusId::ApplyRescan),
+                        |ui| {
+                            ui.add_enabled(
+                                !self.syncing,
+                                egui::Button::new(keyboard::layout_job_for_label(
+                                    ui,
+                                    &keyboard::parse_access_label(keyboard::raw_label_for(
+                                        keyboard::FocusId::ApplyRescan,
+                                    )),
+                                    show_mnemonic,
+                                    egui::TextStyle::Button,
+                                )),
+                            )
+                        },
+                    )
+                    .inner;
+                self.paint_focus_if(ui, r.rect, keyboard::FocusId::ApplyRescan);
+                if r.clicked() {
                     self.apply_excludes();
                 }
             });
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(
-                        !self.syncing && self.folders_idle(),
-                        egui::Button::new("Run sync"),
-                    )
-                    .clicked()
-                {
+                let r = ui
+                    .push_id(keyboard::focus_egui_id(keyboard::FocusId::RunSync), |ui| {
+                        ui.add_enabled(
+                            !self.syncing && self.folders_idle(),
+                            egui::Button::new(keyboard::layout_job_for_label(
+                                ui,
+                                &keyboard::parse_access_label(keyboard::raw_label_for(
+                                    keyboard::FocusId::RunSync,
+                                )),
+                                show_mnemonic,
+                                egui::TextStyle::Button,
+                            )),
+                        )
+                    })
+                    .inner;
+                self.paint_focus_if(ui, r.rect, keyboard::FocusId::RunSync);
+                if r.clicked() {
                     self.start_sync();
                 }
                 ui.weak(&self.sync_status);
@@ -1041,17 +1277,31 @@ impl eframe::App for RsyncStatApp {
             .default_size(280.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(active == ActivePane::Source, "Tree A")
-                        .clicked()
-                    {
+                    let r = keyboard::mnemonic_selectable(
+                        ui,
+                        keyboard::FocusId::TreeTabA,
+                        keyboard::raw_label_for(keyboard::FocusId::TreeTabA),
+                        active == ActivePane::Source,
+                        show_mnemonic,
+                    );
+                    self.paint_focus_if(ui, r.rect, keyboard::FocusId::TreeTabA);
+                    if r.clicked() {
                         self.active_pane = ActivePane::Source;
+                        self.kbd.focused = keyboard::FocusId::TreeTabA;
                     }
-                    if ui
-                        .selectable_label(active == ActivePane::Target, "Tree B")
-                        .clicked()
-                    {
-                        self.active_pane = ActivePane::Target;
+                    if self.dual_pane {
+                        let r = keyboard::mnemonic_selectable(
+                            ui,
+                            keyboard::FocusId::TreeTabB,
+                            keyboard::raw_label_for(keyboard::FocusId::TreeTabB),
+                            active == ActivePane::Target,
+                            show_mnemonic,
+                        );
+                        self.paint_focus_if(ui, r.rect, keyboard::FocusId::TreeTabB);
+                        if r.clicked() {
+                            self.active_pane = ActivePane::Target;
+                            self.kbd.focused = keyboard::FocusId::TreeTabB;
+                        }
                     }
                 });
                 ui.separator();
@@ -1068,7 +1318,12 @@ impl eframe::App for RsyncStatApp {
                     );
                     ui.separator();
                 }
-                ui.heading("Directory tree");
+                ui.heading(
+                    keyboard::parse_access_label(keyboard::raw_label_for(
+                        keyboard::FocusId::DirectoryTree,
+                    ))
+                    .display,
+                );
                 ui.separator();
                 if let Some(ref t) = tree {
                     let root_path = vec![t.name.clone()];
@@ -1081,19 +1336,30 @@ impl eframe::App for RsyncStatApp {
                         }
                     };
                     let tree_height = (ui.available_height() - 320.0).max(100.0);
-                    egui::ScrollArea::both()
-                        .max_height(tree_height)
-                        .show(ui, |ui| {
-                            ui::tree_view_with_path(
-                                ui,
-                                t,
-                                &root_path,
-                                selected,
-                                hover,
-                                partner_rel.as_deref(),
-                                other_ready.then_some(other_files.as_ref()),
-                            );
-                        });
+                    let tree_scroll =
+                        egui::ScrollArea::both()
+                            .max_height(tree_height)
+                            .show(ui, |ui| {
+                                ui.push_id(
+                                    keyboard::focus_egui_id(keyboard::FocusId::DirectoryTree),
+                                    |ui| {
+                                        ui::tree_view_with_path(
+                                            ui,
+                                            t,
+                                            &root_path,
+                                            selected,
+                                            hover,
+                                            partner_rel.as_deref(),
+                                            other_ready.then_some(other_files.as_ref()),
+                                        );
+                                    },
+                                );
+                            });
+                    self.paint_focus_if(
+                        ui,
+                        tree_scroll.inner_rect,
+                        keyboard::FocusId::DirectoryTree,
+                    );
                 } else if active_scanning {
                     ui.label("Starting…");
                 } else {
@@ -1126,6 +1392,7 @@ impl eframe::App for RsyncStatApp {
                     ActivePane::Source,
                     ui.available_size(),
                     ui.scope_id().with("solo"),
+                    show_mnemonic,
                 );
                 return;
             }
@@ -1146,6 +1413,7 @@ impl eframe::App for RsyncStatApp {
                             ActivePane::Source,
                             Vec2::new(left_w, height),
                             ui.scope_id().with("pane_a"),
+                            show_mnemonic,
                         );
                     },
                 );
@@ -1169,6 +1437,16 @@ impl eframe::App for RsyncStatApp {
                             ((pos.x - parent.left()) / parent.width()).clamp(0.15, 0.85);
                     }
                 }
+                self.paint_focus_if(ui, split_rect, keyboard::FocusId::Splitter);
+                if keyboard::is_focused(&self.kbd, keyboard::FocusId::Splitter) {
+                    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(150, 200, 255));
+                    ui.painter().rect_stroke(
+                        split_rect.expand(1.0),
+                        2.0,
+                        stroke,
+                        egui::StrokeKind::Outside,
+                    );
+                }
 
                 let right_w = total_w - left_w - splitter_w;
                 ui.allocate_ui_with_layout(
@@ -1180,6 +1458,7 @@ impl eframe::App for RsyncStatApp {
                             ActivePane::Target,
                             Vec2::new(right_w, height),
                             ui.scope_id().with("pane_b"),
+                            show_mnemonic,
                         );
                     },
                 );
@@ -1193,7 +1472,14 @@ impl eframe::App for RsyncStatApp {
 }
 
 impl RsyncStatApp {
-    fn draw_pane(&mut self, ui: &mut egui::Ui, pane: ActivePane, size: Vec2, pane_id: egui::Id) {
+    fn draw_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: ActivePane,
+        size: Vec2,
+        pane_id: egui::Id,
+        show_mnemonic: bool,
+    ) {
         let title = match pane {
             ActivePane::Source => "Source (A)",
             ActivePane::Target => "Target (B)",
@@ -1203,11 +1489,37 @@ impl RsyncStatApp {
         let bounds = ui.max_rect();
         ui.set_clip_rect(ui.clip_rect().intersect(bounds));
         ui.heading(title);
+        let (choose_id, rescan_id, treemap_id) = match pane {
+            ActivePane::Source => (
+                keyboard::FocusId::PaneAChoose,
+                keyboard::FocusId::PaneARescan,
+                keyboard::FocusId::TreemapA,
+            ),
+            ActivePane::Target => (
+                keyboard::FocusId::PaneBChoose,
+                keyboard::FocusId::PaneBRescan,
+                keyboard::FocusId::TreemapB,
+            ),
+        };
         ui.horizontal(|ui| {
-            if ui.button("Choose folder…").clicked() {
+            let r = keyboard::mnemonic_button(
+                ui,
+                choose_id,
+                keyboard::raw_label_for(choose_id),
+                show_mnemonic,
+            );
+            self.paint_focus_if(ui, r.rect, choose_id);
+            if r.clicked() {
                 self.pick_folder(pane);
             }
-            if ui.button("Rescan").clicked() {
+            let r = keyboard::mnemonic_button(
+                ui,
+                rescan_id,
+                keyboard::raw_label_for(rescan_id),
+                show_mnemonic,
+            );
+            self.paint_focus_if(ui, r.rect, rescan_id);
+            if r.clicked() {
                 if let Some(path) = self.pane(pane).root.clone() {
                     self.start_scan(pane, path);
                     ui.ctx().request_repaint();
@@ -1260,6 +1572,14 @@ impl RsyncStatApp {
                     });
                 });
             } else {
+                let treemap_focused = keyboard::is_focused(&self.kbd, treemap_id);
+                let map_focus = keyboard::focus_region(
+                    ui,
+                    treemap_id,
+                    ui.available_size(),
+                    Sense::click_and_drag(),
+                );
+                keyboard::paint_focus_ring(ui, map_focus.rect, treemap_focused);
                 let ctx = ui::TreemapCtx {
                     selected,
                     hover,
@@ -1288,7 +1608,7 @@ impl RsyncStatApp {
     }
 }
 
-fn find_by_path<'a>(root: &'a TreeNode, path: &[String]) -> Option<&'a TreeNode> {
+pub(crate) fn find_by_path<'a>(root: &'a TreeNode, path: &[String]) -> Option<&'a TreeNode> {
     if path.first()? != &root.name {
         return None;
     }

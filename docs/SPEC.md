@@ -8,6 +8,7 @@ A native Rust app that shows two folders as one disk-usage treemap colored by sy
 - [Goals and non-goals](#goals-and-non-goals)
 - [What exists today](#what-exists-today)
 - [Core UX](#core-ux)
+- [Keyboard](#keyboard)
 - [Exclude filters](#exclude-filters)
 - [Sync engine](#sync-engine)
 - [Architecture](#architecture)
@@ -105,6 +106,44 @@ While a pane is scanning, the bottom status bar shows the **current path** being
 - If the full path does not fit, **elide from the middle**, keeping the volume/root prefix and the deepest folders plus file name (e.g. `C:\Users\alex\…\deep\folder\file.bin`)
 - Layout **recomputes on resize**; the **full path** is always available in a hover tooltip
 - One line per pane, prefixed `A:` and `B:` when side-by-side; single-pane mode shows only the active scan line
+
+## Keyboard
+
+Keyboard-first interaction is a first-class requirement, tuned for **Omarchy (Hyprland on Wayland)** but identical on macOS and Windows. egui **0.37 has no built-in Alt/access-key API** ([#429](https://github.com/emilk/egui/issues/429)); RSyncStat implements mnemonics, focus traversal and global shortcuts in `rsyncstat-app` (`keyboard` module) with `LayoutJob` underlines and centralized label constants.
+
+### Focus and Tab order
+
+- **Tab** / **Shift+Tab** move focus through every interactive control in a fixed **left-to-right, top-to-bottom** order: menu and sync bar, left tree panel, then **pane A** controls and treemap, then **pane B** (when side-by-side). Non-interactive labels and legends are skipped.
+- The focused control gets a **high-contrast focus ring** (rounded stroke using the theme’s selection color).
+- **Enter** or **Space** activates the focused control (button, checkbox, tab, combo).
+- **Escape** closes the shortcut cheat sheet, then cancels an in-flight **sync** or **scan** on the active pane (cooperative cancel, same as Rescan).
+
+### Mnemonics (access keys)
+
+- Labels use Windows/GTK-style markers: **`&`** before the access letter (e.g. `&Open source (A)…`). A literal ampersand is written as `&&`.
+- Pressing **Alt+letter** (case-insensitive) focuses and activates that control when it is visible. Duplicate mnemonics in one view are forbidden; CI tests assert uniqueness.
+- **Underline visibility:** optional **always show** underlines (default on **Linux**, including Omarchy) or **only while Alt is held** (default on macOS and Windows). A toolbar toggle changes the mode session-wide.
+
+### Global shortcuts
+
+Shortcuts use **Ctrl** (not **Super**) so they do not fight Hyprland’s default **Super** bindings (workspaces, launcher, etc.). **Alt** is reserved for mnemonics; on some Wayland compositors Alt may be grabbed before the app sees it ([#8249](https://github.com/emilk/egui/issues/8249)).
+
+| Shortcut | Action |
+|----------|--------|
+| **F1** or **?** | Open / close keyboard cheat sheet |
+| **Ctrl+1** / **Ctrl+2** | Focus treemap and toolbar for pane A / B |
+| **Ctrl+O** | Choose folder (active pane) |
+| **Ctrl+R** or **F5** | Rescan active pane |
+| **Ctrl+Shift+C** | Rebuild compare (when both scans are idle) |
+| **Arrow keys** | When treemap is focused: move selection into child (**Right**/**Down**), to parent (**Left**/**Up**) |
+
+Treemap arrow navigation updates the same selection path as click/hover and drives counterpart highlight in the other pane.
+
+### Hyprland / Omarchy notes
+
+- Validate keyboard delivery on Alex’s Hyprland session; if keys are missing, check egui **#8249** and compositor **Alt**/`Super` binds.
+- Prefer **Ctrl** chords for global actions; avoid rebinding **Super** inside the app.
+- Default **always-on mnemonic underlines** on Linux improve discoverability when Alt is consumed by the compositor.
 
 ### Plan, then run
 
