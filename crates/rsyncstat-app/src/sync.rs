@@ -1,0 +1,491 @@
+//! Compare two scanned trees and copy files between them.
+//!
+//! One-way sync copies missing files and overwrites when the size differs.
+//! It does not delete extras on the destination. Two-way sync copies only
+//! files that are missing on the other side, and leaves size mismatches alone.
+
+use rsyncstat_model::TreeNode;
+use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncMethod {
+    AtoB,
+    BtoA,
+    BothWays,
+}
+
+impl SyncMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AtoB => "Copy A → B",
+            Self::BtoA => "Copy B → A",
+            Self::BothWays => "Two-way (missing only)",
+        }
+    }
+
+    pub fn all() -> [Self; 3] {
+        [Self::AtoB, Self::BtoA, Self::BothWays]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchKind {
+    Same,
+    Different,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncRules {
+    /// Extensions without a leading dot, matched case-insensitively.
+    /// `tar.gz` matches names that end in `.tar.gz`.
+    pub file_types: Vec<String>,
+    /// Directory names. A match anywhere in the relative path drops that subtree.
+    pub dir_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyOp {
+    pub rel: String,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncPlan {
+    pub a_to_b: Vec<CopyOp>,
+    pub b_to_a: Vec<CopyOp>,
+    pub same: u64,
+    pub different: u64,
+    pub excluded: u64,
+}
+
+impl SyncPlan {
+    pub fn copy_count(&self) -> usize {
+        self.a_to_b.len() + self.b_to_a.len()
+    }
+
+    pub fn copy_bytes(&self) -> u64 {
+        self.a_to_b
+            .iter()
+            .chain(self.b_to_a.iter())
+            .map(|op| op.bytes)
+            .sum()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompareSummary {
+    pub same: u64,
+    pub different: u64,
+    pub only_a: u64,
+    pub only_b: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SyncReport {
+    pub copied: u64,
+    pub bytes: u64,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug)]
+pub enum SyncEvent {
+    Progress { done: u64, total: u64, rel: String },
+    Finished(SyncReport),
+}
+
+pub fn parse_file_types(raw: &str) -> Vec<String> {
+    split_tokens(raw)
+        .into_iter()
+        .map(|token| {
+            token
+                .trim_start_matches("*.")
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+        })
+        .filter(|token| is_safe_token(token))
+        .collect()
+}
+
+pub fn parse_dir_names(raw: &str) -> Vec<String> {
+    split_tokens(raw)
+        .into_iter()
+        .map(|token| token.trim_matches('/').to_string())
+        .filter(|token| is_safe_token(token))
+        .collect()
+}
+
+pub fn rules_from_text(file_types: &str, dir_names: &str) -> SyncRules {
+    SyncRules {
+        file_types: parse_file_types(file_types),
+        dir_names: parse_dir_names(dir_names),
+    }
+}
+
+/// Preset lines plus the extra type and directory excludes, ready for [`rsyncstat_filter::FilterSet`].
+pub fn filter_lines(file_types: &str, dir_names: &str) -> Vec<String> {
+    let rules = rules_from_text(file_types, dir_names);
+    let mut lines: Vec<String> = rsyncstat_filter::default_preset_rules()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for ext in rules.file_types {
+        lines.push(format!("*.{ext}"));
+    }
+    for name in rules.dir_names {
+        lines.push(format!("{name}/"));
+    }
+    lines
+}
+
+pub fn match_file(rel: &str, size: u64, other: &HashMap<String, u64>) -> Option<MatchKind> {
+    match other.get(rel) {
+        Some(other_size) if *other_size == size => Some(MatchKind::Same),
+        Some(_) => Some(MatchKind::Different),
+        None => None,
+    }
+}
+
+pub fn compare_indexes(a: &HashMap<String, u64>, b: &HashMap<String, u64>) -> CompareSummary {
+    let mut summary = CompareSummary::default();
+    for (rel, size_a) in a {
+        match b.get(rel) {
+            Some(size_b) if size_b == size_a => summary.same += 1,
+            Some(_) => summary.different += 1,
+            None => summary.only_a += 1,
+        }
+    }
+    for rel in b.keys() {
+        if !a.contains_key(rel) {
+            summary.only_b += 1;
+        }
+    }
+    summary
+}
+
+pub fn plan_sync(a: &TreeNode, b: &TreeNode, method: SyncMethod, rules: &SyncRules) -> SyncPlan {
+    let (files_a, excluded_a) = collect_files(a, rules);
+    let (files_b, excluded_b) = collect_files(b, rules);
+    let mut plan = SyncPlan {
+        excluded: excluded_a + excluded_b,
+        ..SyncPlan::default()
+    };
+    for (rel, size_a) in &files_a {
+        match files_b.get(rel) {
+            Some(size_b) if size_b == size_a => plan.same += 1,
+            Some(size_b) => match method {
+                SyncMethod::AtoB => plan.a_to_b.push(CopyOp {
+                    rel: rel.clone(),
+                    bytes: *size_a,
+                }),
+                SyncMethod::BtoA => plan.b_to_a.push(CopyOp {
+                    rel: rel.clone(),
+                    bytes: *size_b,
+                }),
+                SyncMethod::BothWays => plan.different += 1,
+            },
+            None => {
+                if matches!(method, SyncMethod::AtoB | SyncMethod::BothWays) {
+                    plan.a_to_b.push(CopyOp {
+                        rel: rel.clone(),
+                        bytes: *size_a,
+                    });
+                }
+            }
+        }
+    }
+    for (rel, size_b) in &files_b {
+        if files_a.contains_key(rel) {
+            continue;
+        }
+        if matches!(method, SyncMethod::BtoA | SyncMethod::BothWays) {
+            plan.b_to_a.push(CopyOp {
+                rel: rel.clone(),
+                bytes: *size_b,
+            });
+        }
+    }
+    plan.a_to_b.sort_by(|left, right| left.rel.cmp(&right.rel));
+    plan.b_to_a.sort_by(|left, right| left.rel.cmp(&right.rel));
+    plan
+}
+
+pub fn execute(
+    root_a: &Path,
+    root_b: &Path,
+    plan: &SyncPlan,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64, u64, &str),
+) -> SyncReport {
+    let total = plan.copy_count() as u64;
+    let mut report = SyncReport::default();
+    let mut done = 0u64;
+    for (op, from_root, to_root) in plan
+        .a_to_b
+        .iter()
+        .map(|op| (op, root_a, root_b))
+        .chain(plan.b_to_a.iter().map(|op| (op, root_b, root_a)))
+    {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        done += 1;
+        progress(done, total, &op.rel);
+        match copy_rel(from_root, to_root, &op.rel) {
+            Ok(bytes) => {
+                report.copied += 1;
+                report.bytes += bytes;
+            }
+            Err(err) => {
+                if report.errors.len() < 20 {
+                    report.errors.push(format!("{}: {err}", op.rel));
+                }
+            }
+        }
+    }
+    report
+}
+
+pub fn spawn_sync(
+    root_a: PathBuf,
+    root_b: PathBuf,
+    plan: SyncPlan,
+    cancel: Arc<AtomicBool>,
+    tx: crossbeam_channel::Sender<SyncEvent>,
+) {
+    std::thread::spawn(move || {
+        let report = execute(&root_a, &root_b, &plan, &cancel, |done, total, rel| {
+            let _ = tx.send(SyncEvent::Progress {
+                done,
+                total,
+                rel: rel.to_string(),
+            });
+        });
+        let _ = tx.send(SyncEvent::Finished(report));
+    });
+}
+
+fn copy_rel(from_root: &Path, to_root: &Path, rel: &str) -> io::Result<u64> {
+    let rel_path =
+        safe_rel(rel).ok_or_else(|| io::Error::other("refusing unsafe relative path"))?;
+    let from = from_root.join(&rel_path);
+    let to = to_root.join(&rel_path);
+    let parent = to
+        .parent()
+        .ok_or_else(|| io::Error::other("destination has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let mut tmp_name = to
+        .file_name()
+        .ok_or_else(|| io::Error::other("destination has no file name"))?
+        .to_os_string();
+    tmp_name.push(".rsyncstat-tmp");
+    let tmp = to.with_file_name(tmp_name);
+    let bytes = fs::copy(&from, &tmp)?;
+    if to.exists() {
+        fs::remove_file(&to)?;
+    }
+    if let Err(err) = fs::rename(&tmp, &to) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(bytes)
+}
+
+fn safe_rel(rel: &str) -> Option<PathBuf> {
+    if rel.is_empty() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for part in rel.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return None;
+        }
+        out.push(part);
+    }
+    Some(out)
+}
+
+fn collect_files(root: &TreeNode, rules: &SyncRules) -> (HashMap<String, u64>, u64) {
+    let mut files = HashMap::new();
+    let mut excluded = 0u64;
+    walk(root, "", rules, &mut files, &mut excluded);
+    (files, excluded)
+}
+
+fn walk(
+    node: &TreeNode,
+    prefix: &str,
+    rules: &SyncRules,
+    files: &mut HashMap<String, u64>,
+    excluded: &mut u64,
+) {
+    for child in &node.children {
+        let rel = if prefix.is_empty() {
+            child.name.clone()
+        } else {
+            format!("{prefix}/{}", child.name)
+        };
+        if child.is_dir {
+            if child.excluded || rules.dir_names.iter().any(|name| name == &child.name) {
+                *excluded += count_files(child);
+                continue;
+            }
+            walk(child, &rel, rules, files, excluded);
+        } else if child.excluded || ext_excluded(&child.name, &rules.file_types) {
+            *excluded += 1;
+        } else {
+            files.insert(rel, child.size);
+        }
+    }
+}
+
+fn count_files(node: &TreeNode) -> u64 {
+    if !node.is_dir {
+        return 1;
+    }
+    node.children.iter().map(count_files).sum()
+}
+
+fn ext_excluded(name: &str, types: &[String]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    types.iter().any(|ext| lower.ends_with(&format!(".{ext}")))
+}
+
+fn split_tokens(raw: &str) -> Vec<&str> {
+    raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn is_safe_token(token: &str) -> bool {
+    !token.is_empty()
+        && token != "."
+        && token != ".."
+        && !token.contains(['/', '\\', '*', '?', '!', '#', '[', ']'])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn sample_trees() -> (TreeNode, TreeNode) {
+        let mut a = TreeNode::new_dir("A");
+        a.insert_scanned(Path::new("same.txt"), 10, false, false, None);
+        a.insert_scanned(Path::new("only_a.txt"), 4, false, false, None);
+        a.insert_scanned(Path::new("diff.txt"), 1, false, false, None);
+        a.insert_scanned(Path::new("notes.log"), 3, false, false, None);
+        a.insert_scanned(Path::new("skip/secret.txt"), 9, false, false, None);
+
+        let mut b = TreeNode::new_dir("B");
+        b.insert_scanned(Path::new("same.txt"), 10, false, false, None);
+        b.insert_scanned(Path::new("only_b.txt"), 8, false, false, None);
+        b.insert_scanned(Path::new("diff.txt"), 5, false, false, None);
+        b.insert_scanned(Path::new("photo.JPG"), 2, false, false, None);
+        (a, b)
+    }
+
+    #[test]
+    fn parses_types_and_directory_names() {
+        assert_eq!(
+            parse_file_types("log, *.bak TMP .jpg"),
+            vec!["log", "bak", "tmp", "jpg"]
+        );
+        assert_eq!(
+            parse_dir_names("node_modules, .git, node_modules/"),
+            vec!["node_modules", ".git", "node_modules"]
+        );
+        assert!(parse_dir_names("skip/nested").is_empty());
+    }
+
+    #[test]
+    fn one_way_copies_missing_and_different_sizes() {
+        let (a, b) = sample_trees();
+        let rules = rules_from_text("log, jpg", "skip");
+        let plan = plan_sync(&a, &b, SyncMethod::AtoB, &rules);
+        assert_eq!(plan.same, 1);
+        assert_eq!(
+            plan.a_to_b
+                .iter()
+                .map(|op| op.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["diff.txt", "only_a.txt"]
+        );
+        assert!(plan.b_to_a.is_empty());
+        assert!(plan.excluded >= 3);
+    }
+
+    #[test]
+    fn two_way_copies_only_missing_files() {
+        let (a, b) = sample_trees();
+        let rules = rules_from_text("log jpg", "skip");
+        let plan = plan_sync(&a, &b, SyncMethod::BothWays, &rules);
+        assert_eq!(plan.different, 1);
+        assert_eq!(plan.a_to_b.len(), 1);
+        assert_eq!(plan.a_to_b[0].rel, "only_a.txt");
+        assert_eq!(plan.b_to_a.len(), 1);
+        assert_eq!(plan.b_to_a[0].rel, "only_b.txt");
+    }
+
+    #[test]
+    fn compare_counts_each_side() {
+        let mut a = HashMap::new();
+        a.insert("same.txt".into(), 10);
+        a.insert("diff.txt".into(), 1);
+        a.insert("only_a.txt".into(), 4);
+        let mut b = HashMap::new();
+        b.insert("same.txt".into(), 10);
+        b.insert("diff.txt".into(), 5);
+        b.insert("only_b.txt".into(), 8);
+        let summary = compare_indexes(&a, &b);
+        assert_eq!(
+            summary,
+            CompareSummary {
+                same: 1,
+                different: 1,
+                only_a: 1,
+                only_b: 1,
+            }
+        );
+        assert_eq!(match_file("same.txt", 10, &b), Some(MatchKind::Same));
+        assert_eq!(match_file("diff.txt", 1, &b), Some(MatchKind::Different));
+        assert_eq!(match_file("only_a.txt", 4, &b), None);
+    }
+
+    #[test]
+    fn execute_copies_missing_file_and_refuses_parent_segments() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rsyncstat-sync-{nanos}"));
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(a.join("sub")).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("sub/hello.txt"), b"hello").unwrap();
+        let plan = SyncPlan {
+            a_to_b: vec![
+                CopyOp {
+                    rel: "sub/hello.txt".into(),
+                    bytes: 5,
+                },
+                CopyOp {
+                    rel: "../escape.txt".into(),
+                    bytes: 1,
+                },
+            ],
+            ..SyncPlan::default()
+        };
+        let report = execute(&a, &b, &plan, &AtomicBool::new(false), |_, _, _| {});
+        assert_eq!(report.copied, 1);
+        assert_eq!(fs::read(b.join("sub/hello.txt")).unwrap(), b"hello");
+        assert_eq!(report.errors.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+}

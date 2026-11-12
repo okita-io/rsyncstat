@@ -1,10 +1,11 @@
 //! RSyncStat M0/M1 UI: dual-root treemap comparison.
 
+mod sync;
 mod ui;
 
 use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use eframe::egui::{self, Sense, Vec2};
-use rsyncstat_filter::FilterSet;
+use rsyncstat_filter::{FilterSet, RuleLevel};
 use rsyncstat_model::{file_type_bucket, TreeNode};
 use rsyncstat_scan::{scan_root_async, ScanUpdate};
 use std::collections::{HashMap, VecDeque};
@@ -12,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use sync::{CompareSummary, SyncEvent, SyncMethod, SyncPlan};
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -51,6 +53,8 @@ struct PaneState {
     hover_path: Option<Vec<String>>,
     recent_dirs: VecDeque<String>,
     legend: HashMap<&'static str, u64>,
+    /// Relative path → size for files that are in scope. Used to highlight matches.
+    file_sizes: Arc<HashMap<String, u64>>,
     stats: ScanStats,
     started: Instant,
     idle_status: String,
@@ -69,6 +73,7 @@ impl PaneState {
             hover_path: None,
             recent_dirs: VecDeque::new(),
             legend: HashMap::new(),
+            file_sizes: Arc::new(HashMap::new()),
             stats: ScanStats {
                 paths: 0,
                 files: 0,
@@ -128,6 +133,15 @@ impl PaneState {
                     let name = name.to_string_lossy();
                     *self.legend.entry(file_type_bucket(&name)).or_default() += entry.size;
                 }
+                if !entry.excluded {
+                    let key = entry
+                        .rel
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    Arc::make_mut(&mut self.file_sizes).insert(key, entry.size);
+                }
             }
         }
     }
@@ -164,6 +178,17 @@ struct RsyncStatApp {
     dual_pane: bool,
     split_fraction: f32,
     active_pane: ActivePane,
+    sync_method: SyncMethod,
+    exclude_types: String,
+    exclude_dirs: String,
+    compare: Option<CompareSummary>,
+    compare_dirty: bool,
+    preview: Option<SyncPlan>,
+    preview_key: String,
+    sync_rx: Option<Receiver<SyncEvent>>,
+    sync_cancel: Option<Arc<AtomicBool>>,
+    syncing: bool,
+    sync_status: String,
 }
 
 impl RsyncStatApp {
@@ -175,6 +200,17 @@ impl RsyncStatApp {
             dual_pane: true,
             split_fraction: 0.5,
             active_pane: ActivePane::Source,
+            sync_method: SyncMethod::AtoB,
+            exclude_types: String::new(),
+            exclude_dirs: String::new(),
+            compare: None,
+            compare_dirty: false,
+            preview: None,
+            preview_key: String::new(),
+            sync_rx: None,
+            sync_cancel: None,
+            syncing: false,
+            sync_status: "Sync copies files. It does not delete extras.".to_string(),
         }
     }
 
@@ -201,6 +237,7 @@ impl RsyncStatApp {
         state.tree = None;
         state.recent_dirs.clear();
         state.legend.clear();
+        state.file_sizes = Arc::new(HashMap::new());
         state.stats = ScanStats {
             paths: 0,
             files: 0,
@@ -216,6 +253,9 @@ impl RsyncStatApp {
         state.scan_rx = Some(rx);
         scan_root_async(path, Arc::clone(&self.filter), tx, cancel);
         self.active_pane = pane;
+        self.compare = None;
+        self.compare_dirty = true;
+        self.preview = None;
     }
 
     fn pane_mut(&mut self, pane: ActivePane) -> &mut PaneState {
@@ -236,7 +276,16 @@ impl RsyncStatApp {
         let mut repainting = false;
         repainting |= Self::poll_pane(&mut self.source, ctx);
         repainting |= Self::poll_pane(&mut self.target, ctx);
+        if self.compare_dirty && !self.source.scanning && !self.target.scanning {
+            self.refresh_compare();
+        }
+        if self.poll_sync() {
+            ctx.request_repaint();
+        }
         if repainting && (self.source.scanning || self.target.scanning) {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        if self.syncing {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
@@ -258,6 +307,7 @@ impl RsyncStatApp {
                     state.tree = Some(TreeNode::new_dir(root_name));
                     state.recent_dirs.clear();
                     state.legend.clear();
+                    state.file_sizes = Arc::new(HashMap::new());
                     state.stats = ScanStats {
                         paths: 0,
                         files: 0,
@@ -317,6 +367,190 @@ impl RsyncStatApp {
             .or(other_state.selected_path.as_ref())
             .map(|p| ui::rel_within_root(p))
     }
+
+    fn rules_key(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.sync_method.label(),
+            self.exclude_types,
+            self.exclude_dirs
+        )
+    }
+
+    fn refresh_compare(&mut self) {
+        self.compare_dirty = false;
+        if self.source.tree.is_none() || self.target.tree.is_none() {
+            self.compare = None;
+            return;
+        }
+        self.compare = Some(sync::compare_indexes(
+            &self.source.file_sizes,
+            &self.target.file_sizes,
+        ));
+        self.preview = Some(self.build_plan());
+        self.preview_key = self.rules_key();
+    }
+
+    fn build_plan(&self) -> SyncPlan {
+        match (self.source.tree.as_ref(), self.target.tree.as_ref()) {
+            (Some(a), Some(b)) => sync::plan_sync(
+                a,
+                b,
+                self.sync_method,
+                &sync::rules_from_text(&self.exclude_types, &self.exclude_dirs),
+            ),
+            _ => SyncPlan::default(),
+        }
+    }
+
+    fn apply_excludes(&mut self) {
+        if self.syncing {
+            return;
+        }
+        let lines = sync::filter_lines(&self.exclude_types, &self.exclude_dirs);
+        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+        self.filter = Arc::new(FilterSet::from_lines(&borrowed, RuleLevel::Profile));
+        if let Some(path) = self.source.root.clone() {
+            self.start_scan(ActivePane::Source, path);
+        }
+        if let Some(path) = self.target.root.clone() {
+            self.start_scan(ActivePane::Target, path);
+        }
+        self.sync_status = "Excludes applied. Open folders are scanning again.".to_string();
+    }
+
+    fn start_sync(&mut self) {
+        if self.syncing || self.source.scanning || self.target.scanning {
+            return;
+        }
+        let (Some(root_a), Some(root_b)) = (self.source.root.clone(), self.target.root.clone())
+        else {
+            self.sync_status = "Choose both folders before syncing.".to_string();
+            return;
+        };
+        if self.source.tree.is_none() || self.target.tree.is_none() {
+            self.sync_status = "Scan both folders before syncing.".to_string();
+            return;
+        }
+        let plan = self.build_plan();
+        self.preview = Some(plan.clone());
+        self.preview_key = self.rules_key();
+        if plan.copy_count() == 0 {
+            self.sync_status = "Nothing to copy with these settings.".to_string();
+            return;
+        }
+        if let Some(cancel) = self.sync_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.sync_cancel = Some(Arc::clone(&cancel));
+        self.syncing = true;
+        let (tx, rx) = unbounded();
+        self.sync_rx = Some(rx);
+        self.sync_status = format!(
+            "Copying {} files ({})…",
+            plan.copy_count(),
+            format_bytes(plan.copy_bytes())
+        );
+        sync::spawn_sync(root_a, root_b, plan, cancel, tx);
+    }
+
+    fn poll_sync(&mut self) -> bool {
+        let Some(rx) = self.sync_rx.take() else {
+            return false;
+        };
+        let mut keep = true;
+        let mut active = false;
+        loop {
+            match rx.try_recv() {
+                Ok(SyncEvent::Progress { done, total, rel }) => {
+                    active = true;
+                    self.sync_status = format!("Syncing {done}/{total} — {rel}");
+                }
+                Ok(SyncEvent::Finished(report)) => {
+                    active = true;
+                    keep = false;
+                    self.syncing = false;
+                    self.sync_cancel = None;
+                    let errors = if report.errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {} errors.", report.errors.len())
+                    };
+                    self.sync_status = format!(
+                        "Sync finished — {} files, {}.{} Rescanning both folders.",
+                        report.copied,
+                        format_bytes(report.bytes),
+                        errors
+                    );
+                    if report.copied > 0 {
+                        if let Some(path) = self.source.root.clone() {
+                            self.start_scan(ActivePane::Source, path);
+                        }
+                        if let Some(path) = self.target.root.clone() {
+                            self.start_scan(ActivePane::Target, path);
+                        }
+                    }
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.syncing = false;
+                    self.sync_cancel = None;
+                    keep = false;
+                    break;
+                }
+            }
+        }
+        if keep {
+            self.sync_rx = Some(rx);
+        }
+        active || self.syncing
+    }
+
+    fn hover_status(&self) -> Option<String> {
+        let (label, pane, other, other_ready) = if self.source.hover_path.is_some() {
+            (
+                "A",
+                &self.source,
+                &self.target.file_sizes,
+                self.target.tree.is_some(),
+            )
+        } else if self.target.hover_path.is_some() {
+            (
+                "B",
+                &self.target,
+                &self.source.file_sizes,
+                self.source.tree.is_some(),
+            )
+        } else {
+            return None;
+        };
+        let path = pane.hover_path.as_ref()?;
+        let node = pane
+            .tree
+            .as_ref()
+            .and_then(|tree| find_by_path(tree, path))?;
+        let rel = path.iter().skip(1).cloned().collect::<Vec<_>>().join("/");
+        if node.is_dir {
+            return Some(format!("Hover {label}: {rel}/"));
+        }
+        let mark = if other_ready {
+            sync::match_file(&rel, node.size, other)
+        } else {
+            None
+        };
+        let compare = match mark {
+            Some(sync::MatchKind::Same) => "same file on the other side",
+            Some(sync::MatchKind::Different) => "same path, different size",
+            None if other_ready => "only in this folder",
+            None => "not compared yet",
+        };
+        Some(format!(
+            "Hover {label}: {rel} — {} · {compare}",
+            format_bytes(node.size)
+        ))
+    }
 }
 
 impl eframe::App for RsyncStatApp {
@@ -326,7 +560,7 @@ impl eframe::App for RsyncStatApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("menu").show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Open source (A)…").clicked() {
                     self.pick_folder(ActivePane::Source);
                 }
@@ -336,11 +570,73 @@ impl eframe::App for RsyncStatApp {
                 ui.separator();
                 ui.checkbox(&mut self.dual_pane, "Side-by-side A | B");
                 ui.separator();
-                ui.label(
-                    "Filters: default presets (*.lancedb, node_modules/, target/, …). \
-                     File-type colors match across panes; gold outline marks the counterpart path.",
-                );
+                ui.colored_label(egui::Color32::from_rgb(90, 220, 130), "■");
+                ui.label("same file");
+                ui.colored_label(egui::Color32::from_rgb(240, 170, 60), "■");
+                ui.label("different size");
+                ui.separator();
+                ui.weak("Names and sizes appear on hover.");
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Sync");
+                egui::ComboBox::from_id_salt("sync_method")
+                    .selected_text(self.sync_method.label())
+                    .show_ui(ui, |ui| {
+                        for method in SyncMethod::all() {
+                            ui.selectable_value(&mut self.sync_method, method, method.label());
+                        }
+                    });
+                ui.label("Exclude types");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.exclude_types)
+                        .hint_text("log, tmp, jpg")
+                        .desired_width(150.0),
+                );
+                ui.label("Exclude dirs");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.exclude_dirs)
+                        .hint_text("node_modules, .git, target")
+                        .desired_width(190.0),
+                );
+                if ui
+                    .add_enabled(!self.syncing, egui::Button::new("Apply & rescan"))
+                    .clicked()
+                {
+                    self.apply_excludes();
+                }
+                if ui
+                    .add_enabled(
+                        !self.syncing && !self.source.scanning && !self.target.scanning,
+                        egui::Button::new("Run sync"),
+                    )
+                    .clicked()
+                {
+                    self.start_sync();
+                }
+                ui.weak(&self.sync_status);
+            });
+            if let Some(compare) = &self.compare {
+                ui.label(format!(
+                    "Compare: {} same · {} different size · {} only in A · {} only in B",
+                    compare.same, compare.different, compare.only_a, compare.only_b
+                ));
+            }
+            if let Some(plan) = &self.preview {
+                let stale = self.preview_key != self.rules_key();
+                let stale = if stale { " · preview out of date" } else { "" };
+                let held = if self.sync_method == SyncMethod::BothWays {
+                    format!(", {} size mismatches left as-is", plan.different)
+                } else {
+                    String::new()
+                };
+                ui.label(format!(
+                    "Plan: {} A→B, {} B→A, {} same{held}, {} excluded{stale}",
+                    plan.a_to_b.len(),
+                    plan.b_to_a.len(),
+                    plan.same,
+                    plan.excluded,
+                ));
+            }
         });
 
         egui::Panel::bottom("status").show(ui, |ui| {
@@ -353,6 +649,9 @@ impl eframe::App for RsyncStatApp {
                 ui::scan_status_line(ui, "B", self.target.current_scan_path.as_ref());
             } else if self.dual_pane {
                 ui.label(&self.target.idle_status);
+            }
+            if let Some(hover) = self.hover_status() {
+                ui.label(hover);
             }
         });
 
@@ -372,6 +671,14 @@ impl eframe::App for RsyncStatApp {
             .hover_path
             .as_ref()
             .map(|p| ui::rel_within_root(p));
+        let other_files = match active {
+            ActivePane::Source => Arc::clone(&self.target.file_sizes),
+            ActivePane::Target => Arc::clone(&self.source.file_sizes),
+        };
+        let other_ready = match active {
+            ActivePane::Source => self.target.tree.is_some(),
+            ActivePane::Target => self.source.tree.is_some(),
+        };
 
         egui::Panel::left("tree_panel")
             .resizable(true)
@@ -428,6 +735,7 @@ impl eframe::App for RsyncStatApp {
                                 selected,
                                 hover,
                                 partner_rel.as_deref(),
+                                other_ready.then_some(other_files.as_ref()),
                             );
                         });
                 } else if active_scanning {
@@ -539,6 +847,14 @@ impl RsyncStatApp {
 
         let tree = self.pane(pane).tree.clone();
         let partner_rel = self.partner_highlight_rel(pane);
+        let other_files = match pane {
+            ActivePane::Source => Arc::clone(&self.target.file_sizes),
+            ActivePane::Target => Arc::clone(&self.source.file_sizes),
+        };
+        let other_ready = match pane {
+            ActivePane::Source => self.target.tree.is_some(),
+            ActivePane::Target => self.source.tree.is_some(),
+        };
 
         if let Some(ref t) = tree {
             let (selected, hover) = match pane {
@@ -558,7 +874,14 @@ impl RsyncStatApp {
                     hover,
                     partner_highlight_rel: partner_rel,
                 };
-                ui::treemap_view(ui, t, ctx, pane_id, scanning);
+                ui::treemap_view(
+                    ui,
+                    t,
+                    ctx,
+                    pane_id,
+                    scanning,
+                    other_ready.then_some(other_files.as_ref()),
+                );
             }
         } else if scanning {
             ui.centered_and_justified(|ui| {
@@ -570,6 +893,17 @@ impl RsyncStatApp {
             });
         }
     }
+}
+
+fn find_by_path<'a>(root: &'a TreeNode, path: &[String]) -> Option<&'a TreeNode> {
+    if path.first()? != &root.name {
+        return None;
+    }
+    let mut node = root;
+    for part in path.iter().skip(1) {
+        node = node.child(part)?;
+    }
+    Some(node)
 }
 
 fn format_bytes(n: u64) -> String {

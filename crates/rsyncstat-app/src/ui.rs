@@ -1,5 +1,6 @@
 //! Tree, treemap, legend, and status widgets.
 
+use crate::sync::{self, MatchKind};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use rsyncstat_model::{elide_path_for_width, file_type_bucket, TreeNode};
 use rsyncstat_treemap::squarify_indices;
@@ -43,6 +44,7 @@ pub fn tree_view_with_path(
     selected: &mut Option<Vec<String>>,
     hover: &mut Option<Vec<String>>,
     partner_highlight_rel: Option<&[String]>,
+    other_files: Option<&HashMap<String, u64>>,
 ) {
     let size_text = if node.excluded {
         "(excluded)".to_string()
@@ -51,7 +53,16 @@ pub fn tree_view_with_path(
     };
     let suffix = if node.is_dir { "/" } else { "" };
     let is_partner = partner_highlight_rel.map(|p| p == rel_within_root(path).as_slice());
-    let label = format!("{}{suffix}  {size_text}", node.name);
+    let rel = rel_within_root(path).join("/");
+    let mark = if node.is_dir {
+        None
+    } else {
+        other_files.and_then(|files| sync::match_file(&rel, node.size, files))
+    };
+    let mut label = egui::RichText::new(format!("{}{suffix}  {size_text}", node.name));
+    if let Some(kind) = mark {
+        label = label.color(match_color(kind));
+    }
 
     let response = if node.is_dir && !node.children.is_empty() {
         ui.collapsing(label, |ui| {
@@ -65,6 +76,7 @@ pub fn tree_view_with_path(
                     selected,
                     hover,
                     partner_highlight_rel,
+                    other_files,
                 );
             }
         })
@@ -213,6 +225,7 @@ pub fn treemap_view(
     ctx: TreemapCtx<'_>,
     pane_id: egui::Id,
     live: bool,
+    other_files: Option<&HashMap<String, u64>>,
 ) {
     let available = ui.available_size();
     let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
@@ -237,6 +250,7 @@ pub fn treemap_view(
         levels,
         live,
         partner,
+        other_files,
     );
 }
 
@@ -270,6 +284,7 @@ fn paint_children(
     levels: usize,
     live: bool,
     partner_highlight_rel: Option<&[String]>,
+    other_files: Option<&HashMap<String, u64>>,
 ) {
     let values = layout_values(&parent.children, live);
     let layout = squarify_indices(
@@ -298,6 +313,7 @@ fn paint_children(
             levels,
             live,
             partner_highlight_rel,
+            other_files,
         );
         path.pop();
     }
@@ -315,6 +331,7 @@ fn paint_node(
     levels: usize,
     live: bool,
     partner_highlight_rel: Option<&[String]>,
+    other_files: Option<&HashMap<String, u64>>,
 ) {
     if rect.width() < 2.0 || rect.height() < 2.0 {
         return;
@@ -323,38 +340,32 @@ fn paint_node(
     let too_wide = live && node.children.len() > 400;
     let nest =
         node.is_dir && !node.excluded && !node.children.is_empty() && levels > 1 && !too_wide;
+    let rel = rel_within_root(path).join("/");
+    let mark = if node.is_dir {
+        None
+    } else {
+        other_files.and_then(|files| sync::match_file(&rel, node.size, files))
+    };
 
     if node.excluded {
         hatch_rect(painter, rect, ui.visuals().weak_text_color());
-        let title = if node.is_dir {
-            format!("{}/", node.name)
-        } else {
-            node.name.clone()
-        };
-        label_tile(ui, painter, rect, &title, "excluded");
     } else if nest {
         let border = ui.visuals().window_stroke;
         painter.rect_stroke(rect.expand(-1.0), 3.0, border, StrokeKind::Inside);
-        let header_h = 16.0f32.min(rect.height() * 0.25);
-        painter.text(
-            rect.min + Vec2::new(4.0, 2.0),
-            egui::Align2::LEFT_TOP,
-            format!("{}/", node.name),
-            egui::FontId::proportional(11.0),
-            ui.visuals().weak_text_color(),
-        );
-        if rect.width() > 96.0 {
-            painter.text(
-                Pos2::new(rect.max.x - 4.0, rect.min.y + 2.0),
-                egui::Align2::RIGHT_TOP,
-                format_size(node.size),
-                egui::FontId::proportional(10.0),
-                ui.visuals().weak_text_color(),
-            );
-        }
-        let inner = Rect::from_min_max(
-            Pos2::new(rect.min.x + 2.0, rect.min.y + header_h),
-            Pos2::new(rect.max.x - 2.0, rect.max.y - 2.0),
+        let inner = rect.shrink(2.0);
+        // Register this folder before its children so the tile under the pointer
+        // is the one that shows the tooltip.
+        track_pointer(
+            ui,
+            rect,
+            path,
+            parent_id,
+            selected,
+            hover,
+            &rel,
+            node,
+            mark,
+            other_files.is_some(),
         );
         if inner.is_positive() {
             paint_children(
@@ -369,6 +380,7 @@ fn paint_node(
                 levels - 1,
                 live,
                 partner_highlight_rel,
+                other_files,
             );
         }
     } else if node.is_dir {
@@ -377,19 +389,33 @@ fn paint_node(
             2.0,
             type_color(&node.name).gamma_multiply(0.85),
         );
-        label_tile(
-            ui,
-            painter,
-            rect,
-            &format!("{}/", node.name),
-            &format_size(node.size),
-        );
     } else {
-        fill_file_tile(ui, painter, rect, &node.name);
+        fill_file_tile(painter, rect, &node.name);
+        if let Some(kind) = mark {
+            painter.rect_stroke(
+                rect.shrink(1.5),
+                2.0,
+                Stroke::new(2.5, match_color(kind)),
+                StrokeKind::Inside,
+            );
+        }
     }
 
     maybe_partner_stroke(painter, rect, partner_highlight_rel, rel_within_root(path));
-    track_pointer(ui, rect, path, parent_id, selected, hover);
+    if !nest {
+        track_pointer(
+            ui,
+            rect,
+            path,
+            parent_id,
+            selected,
+            hover,
+            &rel,
+            node,
+            mark,
+            other_files.is_some(),
+        );
+    }
 }
 
 fn maybe_partner_stroke(
@@ -408,24 +434,10 @@ fn maybe_partner_stroke(
     }
 }
 
-fn label_tile(ui: &egui::Ui, painter: &egui::Painter, rect: Rect, title: &str, detail: &str) {
-    if rect.width() > 48.0 && rect.height() > 18.0 {
-        painter.text(
-            rect.min + Vec2::new(4.0, 2.0),
-            egui::Align2::LEFT_TOP,
-            title,
-            egui::FontId::proportional(11.0),
-            ui.visuals().text_color(),
-        );
-    }
-    if rect.width() > 48.0 && rect.height() > 32.0 {
-        painter.text(
-            rect.min + Vec2::new(4.0, 16.0),
-            egui::Align2::LEFT_TOP,
-            detail,
-            egui::FontId::proportional(10.0),
-            ui.visuals().weak_text_color(),
-        );
+fn match_color(kind: MatchKind) -> Color32 {
+    match kind {
+        MatchKind::Same => Color32::from_rgb(90, 220, 130),
+        MatchKind::Different => Color32::from_rgb(240, 170, 60),
     }
 }
 
@@ -436,29 +448,56 @@ fn track_pointer(
     parent_id: egui::Id,
     selected: &mut Option<Vec<String>>,
     hover: &mut Option<Vec<String>>,
-) {
+    rel: &str,
+    node: &TreeNode,
+    mark: Option<MatchKind>,
+    other_compared: bool,
+) -> bool {
     let id = parent_id.with(path.join("/"));
     let interact = ui.interact(rect, id, Sense::click());
     if interact.hovered() {
         *hover = Some(path.to_vec());
+        interact
+            .clone()
+            .on_hover_text(hover_tip(rel, node, mark, other_compared));
     }
     if interact.clicked() {
         *selected = Some(path.to_vec());
     }
+    interact.hovered()
 }
 
-fn fill_file_tile(ui: &egui::Ui, painter: &egui::Painter, r: Rect, name: &str) {
+fn hover_tip(rel: &str, node: &TreeNode, mark: Option<MatchKind>, other_compared: bool) -> String {
+    if node.is_dir {
+        let name = if rel.is_empty() {
+            format!("{}/", node.name)
+        } else {
+            format!("{rel}/")
+        };
+        let detail = if node.excluded {
+            "excluded, not measured".to_string()
+        } else {
+            format_size(node.size)
+        };
+        return format!("{name}\n{detail}");
+    }
+    let size = format_size(node.size);
+    let compare = match mark {
+        Some(MatchKind::Same) => "same file on the other side",
+        Some(MatchKind::Different) => "same path, different size",
+        None if other_compared => "only in this folder",
+        None => "",
+    };
+    if compare.is_empty() {
+        format!("{rel}\n{size}")
+    } else {
+        format!("{rel}\n{size} · {compare}")
+    }
+}
+
+fn fill_file_tile(painter: &egui::Painter, r: Rect, name: &str) {
     let color = type_color(file_type_bucket(name));
     painter.rect_filled(r.shrink(1.0), 3.0, color);
-    if r.width() > 56.0 && r.height() > 20.0 {
-        painter.text(
-            r.min + Vec2::new(4.0, 4.0),
-            egui::Align2::LEFT_TOP,
-            name,
-            egui::FontId::proportional(11.0),
-            ui.visuals().text_color(),
-        );
-    }
 }
 
 pub fn hatch_rect(painter: &egui::Painter, rect: Rect, color: Color32) {
