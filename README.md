@@ -18,7 +18,7 @@ The full product spec lives in [docs/SPEC.md](docs/SPEC.md).
 
 ## Prerequisites
 
-- Rust **stable** (see `rust-toolchain.toml`; 1.88+ recommended for current `ignore` / `eframe` releases)
+- Rust **stable ≥ 1.95** (required by eframe/egui 0.37; see `rust-toolchain.toml` and workspace `rust-version`)
 - Platform libraries for the GUI (see below)
 
 ## Build
@@ -51,6 +51,7 @@ Use **Open folder…** to pick a root. The scanner uses all CPU cores, applies d
 ### Windows
 
 - Use a recent Visual Studio Build Tools install (for the MSVC linker) if `rustup` did not configure it.
+- The wgpu 30 stack needs a single `windows` crate version (0.62.x) for both `wgpu-hal` and `gpu-allocator`. If `cargo update` reintroduces `windows` 0.58, run `cargo update -p windows@0.58.0 --precise 0.62.2` and commit `Cargo.lock`.
 - Long paths: the scanner uses the standard library; future milestones will use verbatim `\\?\` paths where needed.
 - Run: `target\release\rsyncstat.exe`
 

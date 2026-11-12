@@ -2,6 +2,7 @@
 name = "rsyncstat-app"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "RSyncStat desktop application"
@@ -19,3 +20,6 @@ rsyncstat-treemap = { path = "../rsyncstat-treemap" }
 eframe.workspace = true
 rfd.workspace = true
 crossbeam-channel.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

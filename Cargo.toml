@@ -17,6 +17,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/okita-io/rsyncstat"
 
@@ -33,3 +34,5 @@ eframe = { version = "0.37", default-features = true }
 rfd = "0.15"
 crossbeam-channel = "0.5"
 num_cpus = "1"
+# Single `windows` version for wgpu-hal 30 + gpu-allocator 0.28 (DX12); see README.
+windows = "0.62.2"
