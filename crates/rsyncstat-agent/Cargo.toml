@@ -1,0 +1,16 @@
+[package]
+name = "rsyncstat-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Remote rsyncstat agent (stub)"
+
+[[bin]]
+name = "rsyncstat-agent"
+path = "src/main.rs"
+
+[dependencies]
+rsyncstat-scan = { path = "../rsyncstat-scan" }
+rsyncstat-filter = { path = "../rsyncstat-filter" }

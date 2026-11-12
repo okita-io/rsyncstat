@@ -1,0 +1,12 @@
+[package]
+name = "rsyncstat-filter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Gitignore-style exclude filters for RSyncStat"
+
+[dependencies]
+ignore.workspace = true
+serde.workspace = true

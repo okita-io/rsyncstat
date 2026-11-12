@@ -1,0 +1,25 @@
+[package]
+name = "rsyncstat-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RSyncStat desktop application"
+default-run = "rsyncstat"
+
+[[bin]]
+name = "rsyncstat"
+path = "src/main.rs"
+
+[dependencies]
+rsyncstat-model = { path = "../rsyncstat-model" }
+rsyncstat-filter = { path = "../rsyncstat-filter" }
+rsyncstat-scan = { path = "../rsyncstat-scan" }
+rsyncstat-treemap = { path = "../rsyncstat-treemap" }
+eframe.workspace = true
+rfd.workspace = true
+crossbeam-channel.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

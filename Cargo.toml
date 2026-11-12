@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsyncstat-model",
+    "crates/rsyncstat-filter",
+    "crates/rsyncstat-scan",
+    "crates/rsyncstat-index",
+    "crates/rsyncstat-reconcile",
+    "crates/rsyncstat-plan",
+    "crates/rsyncstat-exec",
+    "crates/rsyncstat-transport",
+    "crates/rsyncstat-treemap",
+    "crates/rsyncstat-app",
+    "crates/rsyncstat-agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/okita-io/rsyncstat"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+ignore = "0.4"
+rayon = "1"
+blake3 = "1"
+redb = "4"
+trash = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+postcard = { version = "1", features = ["alloc"] }
+eframe = { version = "0.37", default-features = true }
+rfd = "0.15"
+crossbeam-channel = "0.5"
+num_cpus = "1"
+# Single `windows` version for wgpu-hal 30 + gpu-allocator 0.28 (DX12); see README.
+windows = "0.62.2"

@@ -1,0 +1,11 @@
+[package]
+name = "rsyncstat-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local and remote transport (stub)"
+
+[dependencies]
+rsyncstat-exec = { path = "../rsyncstat-exec" }

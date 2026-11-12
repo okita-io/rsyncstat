@@ -1,0 +1,11 @@
+[package]
+name = "rsyncstat-reconcile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Three-way reconciliation (stub)"
+
+[dependencies]
+rsyncstat-model = { path = "../rsyncstat-model" }

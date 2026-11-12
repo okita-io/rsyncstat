@@ -1,0 +1,15 @@
+[package]
+name = "rsyncstat-scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parallel directory scanner for RSyncStat"
+
+[dependencies]
+rsyncstat-filter = { path = "../rsyncstat-filter" }
+rsyncstat-model = { path = "../rsyncstat-model" }
+ignore.workspace = true
+crossbeam-channel.workspace = true
+num_cpus.workspace = true
