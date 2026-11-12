@@ -16,6 +16,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sync::{CompareSummary, SyncEvent, SyncMethod, SyncPlan};
 
+/// Reread the folder that is receiving copies while a sync is running.
+const DEST_REFRESH_EVERY: Duration = Duration::from_secs(3);
+/// Fold at most this many paths into the map on one frame.
+const REFRESH_APPLY_PER_FRAME: usize = 8_000;
+
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -30,7 +35,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivePane {
     Source,
     Target,
@@ -41,6 +46,20 @@ struct ScanStats {
     files: u64,
     excluded_dirs: u64,
     excluded_files: u64,
+}
+
+fn sync_destinations(method: SyncMethod) -> &'static [ActivePane] {
+    match method {
+        SyncMethod::AtoB => &[ActivePane::Target],
+        SyncMethod::BtoA => &[ActivePane::Source],
+        SyncMethod::BothWays => &[ActivePane::Source, ActivePane::Target],
+    }
+}
+
+fn is_copy_temp(rel: &std::path::Path) -> bool {
+    rel.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(sync::COPY_TEMP_SUFFIX))
 }
 
 struct PaneState {
@@ -63,10 +82,14 @@ struct PaneState {
     stats: ScanStats,
     started: Instant,
     idle_status: String,
-    /// How many times this pane has been scanned. Rescan always increments it.
+    /// How many times this pane has been scanned. Each scan increments it.
     pass: u32,
     /// Directory reads that failed and were retried.
     warnings: Vec<String>,
+    /// Reread that folds into the tree already on screen.
+    refreshing: bool,
+    /// A refresh published new sizes. Cleared once the compare is rebuilt.
+    refreshed: bool,
 }
 
 impl PaneState {
@@ -95,6 +118,8 @@ impl PaneState {
             idle_status: idle.to_string(),
             pass: 0,
             warnings: Vec::new(),
+            refreshing: false,
+            refreshed: false,
         }
     }
 
@@ -172,11 +197,7 @@ impl PaneState {
         self.scan_rx = None;
         self.cancel = None;
         self.current_scan_path = None;
-        if let Some(root) = self.root.clone() {
-            if self.volume.is_some() {
-                self.volume = volume::volume_root(&root);
-            }
-        }
+        self.refresh_volume();
         if let Some(tree) = self.tree.as_mut() {
             tree.sort_children_recursive();
             self.legend = ui::collect_type_sizes(tree);
@@ -219,6 +240,60 @@ impl PaneState {
             ));
         }
     }
+
+    fn refresh_volume(&mut self) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        if self.volume.is_some() {
+            self.volume = volume::volume_root(&root);
+        }
+    }
+
+    fn refreshed_status(&self) -> String {
+        let bytes = self
+            .tree
+            .as_ref()
+            .map(|tree| tree.total_size())
+            .unwrap_or(0);
+        let mut status = format!(
+            "Refreshed — {} · {} files.",
+            format_bytes(bytes),
+            self.file_sizes.len(),
+        );
+        if let Some(vol) = self.volume {
+            status.push_str(&format!(" {} free.", format_bytes(vol.available)));
+        }
+        status
+    }
+
+    fn mark_refreshed(&mut self) {
+        if let Some(tree) = self.tree.as_ref() {
+            self.legend = ui::collect_type_sizes(tree);
+        }
+        self.refresh_volume();
+        self.idle_status = self.refreshed_status();
+        self.refreshed = true;
+    }
+
+    fn finish_visible_refresh(&mut self) {
+        if let Some(tree) = self.tree.as_mut() {
+            tree.sort_children_recursive();
+        }
+        self.mark_refreshed();
+        self.refreshing = false;
+        self.cancel = None;
+        self.current_scan_path = None;
+    }
+
+    /// Add paths from a reread. In-progress copy files are skipped so they do not stick.
+    fn apply_refresh_batch(&mut self, entries: Vec<rsyncstat_scan::ScanEntry>) {
+        let entries = entries
+            .into_iter()
+            .filter(|entry| !is_copy_temp(&entry.rel))
+            .collect();
+        self.apply_batch(entries);
+    }
 }
 
 struct RsyncStatApp {
@@ -238,6 +313,10 @@ struct RsyncStatApp {
     sync_rx: Option<Receiver<SyncEvent>>,
     sync_cancel: Option<Arc<AtomicBool>>,
     syncing: bool,
+    /// Direction captured when the sync started. The combo can change mid-run.
+    syncing_method: SyncMethod,
+    /// When to reread the folder that is receiving copies. `None` while a reread is in flight.
+    dest_refresh_at: Option<Instant>,
     sync_status: String,
     /// Tail of the recovery log for the current sync (also written to disk).
     recovery_lines: Vec<String>,
@@ -262,6 +341,8 @@ impl RsyncStatApp {
             sync_rx: None,
             sync_cancel: None,
             syncing: false,
+            syncing_method: SyncMethod::AtoB,
+            dest_refresh_at: None,
             sync_status: "Sync copies files. It does not delete extras.".to_string(),
             recovery_lines: Vec::new(),
         }
@@ -312,6 +393,8 @@ impl RsyncStatApp {
         state.current_scan_path = Some(path.clone());
         state.pass = state.pass.saturating_add(1);
         state.warnings.clear();
+        state.refreshing = false;
+        state.refreshed = false;
         state.idle_status = format!("Scanning {} · pass {}…", path.display(), state.pass);
         let (tx, rx) = unbounded();
         state.scan_rx = Some(rx);
@@ -341,16 +424,27 @@ impl RsyncStatApp {
         let mut repainting = false;
         repainting |= Self::poll_pane(&mut self.source, ctx);
         repainting |= Self::poll_pane(&mut self.target, ctx);
+        if self.source.refreshed || self.target.refreshed {
+            self.source.refreshed = false;
+            self.target.refreshed = false;
+            self.compare_dirty = true;
+        }
         if self.compare_dirty && !self.source.scanning && !self.target.scanning {
             self.refresh_compare();
         }
         if self.poll_sync() {
             ctx.request_repaint();
         }
+        self.poll_destination_refresh();
         // The scan and sync threads only wake the UI when something asks for
         // another frame. A Rescan click happens after this poll, so `ui` also
         // requests a frame while work is in flight.
-        if self.source.scanning || self.target.scanning || self.syncing {
+        if self.source.scanning
+            || self.target.scanning
+            || self.source.refreshing
+            || self.target.refreshing
+            || self.syncing
+        {
             ctx.request_repaint_after(Duration::from_millis(50));
         } else if repainting {
             ctx.request_repaint();
@@ -358,77 +452,155 @@ impl RsyncStatApp {
     }
 
     fn poll_pane(state: &mut PaneState, ctx: &egui::Context) -> bool {
-        let Some(rx) = state.scan_rx.take() else {
-            return false;
-        };
-        let mut keep = true;
         let mut processed = 0usize;
         let mut backlog = false;
-        loop {
-            if processed >= 8_000 {
-                backlog = true;
-                break;
-            }
-            match rx.try_recv() {
-                Ok(ScanUpdate::Started { root_name }) => {
-                    state.tree = Some(TreeNode::new_dir(root_name));
-                    state.recent_dirs.clear();
-                    state.legend.clear();
-                    state.file_sizes = Arc::new(HashMap::new());
-                    state.stats = ScanStats {
-                        paths: 0,
-                        files: 0,
-                        excluded_dirs: 0,
-                        excluded_files: 0,
-                    };
+        if let Some(rx) = state.scan_rx.take() {
+            let mut keep = true;
+            loop {
+                if processed >= REFRESH_APPLY_PER_FRAME {
+                    backlog = true;
+                    break;
                 }
-                Ok(ScanUpdate::Batch(entries)) => {
-                    processed += entries.len();
-                    state.apply_batch(entries);
-                }
-                Ok(ScanUpdate::Visiting(path)) => {
-                    state.current_scan_path = Some(path);
-                }
-                Ok(ScanUpdate::Notice(message)) => {
-                    if state.warnings.len() < 20 {
-                        state.warnings.push(message);
+                match rx.try_recv() {
+                    Ok(ScanUpdate::Started { root_name }) => {
+                        // A reread keeps the map that is already on screen.
+                        if state.refreshing {
+                            continue;
+                        }
+                        state.tree = Some(TreeNode::new_dir(root_name));
+                        state.recent_dirs.clear();
+                        state.legend.clear();
+                        state.file_sizes = Arc::new(HashMap::new());
+                        state.stats = ScanStats {
+                            paths: 0,
+                            files: 0,
+                            excluded_dirs: 0,
+                            excluded_files: 0,
+                        };
+                    }
+                    Ok(ScanUpdate::Batch(entries)) => {
+                        processed += entries.len();
+                        if state.refreshing {
+                            state.apply_refresh_batch(entries);
+                        } else {
+                            state.apply_batch(entries);
+                        }
+                    }
+                    Ok(ScanUpdate::Visiting(path)) => {
+                        if !state.refreshing {
+                            state.current_scan_path = Some(path);
+                        }
+                    }
+                    Ok(ScanUpdate::Notice(message)) => {
+                        if state.warnings.len() < 20 {
+                            state.warnings.push(message);
+                        }
+                    }
+                    Ok(ScanUpdate::Finished) => {
+                        if state.refreshing {
+                            state.finish_visible_refresh();
+                        } else {
+                            state.finish_scan(true);
+                        }
+                        keep = false;
+                        break;
+                    }
+                    Ok(ScanUpdate::Failed(message)) => {
+                        state.scanning = false;
+                        state.scan_rx = None;
+                        state.cancel = None;
+                        state.current_scan_path = None;
+                        if state.refreshing {
+                            state.refreshing = false;
+                            state.idle_status = format!("Refresh failed: {message}");
+                        } else {
+                            state.idle_status = format!("Scan failed: {message}");
+                        }
+                        keep = false;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        if state.refreshing {
+                            state.finish_visible_refresh();
+                        } else if state.scanning {
+                            state.warnings.push(
+                                "Scan stopped before it finished. Press Rescan to read the directories again."
+                                    .into(),
+                            );
+                            state.finish_scan(false);
+                        }
+                        keep = false;
+                        break;
                     }
                 }
-                Ok(ScanUpdate::Finished) => {
-                    state.finish_scan(true);
-                    keep = false;
-                    break;
-                }
-                Ok(ScanUpdate::Failed(message)) => {
-                    state.scanning = false;
-                    state.scan_rx = None;
-                    state.cancel = None;
-                    state.current_scan_path = None;
-                    state.idle_status = format!("Scan failed: {message}");
-                    keep = false;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if state.scanning {
-                        state.warnings.push(
-                            "Scan stopped before it finished. Press Rescan to read the directories again."
-                                .into(),
-                        );
-                        state.finish_scan(false);
-                    }
-                    keep = false;
-                    break;
-                }
+            }
+            if keep {
+                state.scan_rx = Some(rx);
             }
         }
-        if keep {
-            state.scan_rx = Some(rx);
-        }
+
         if backlog {
             ctx.request_repaint();
         }
-        state.scanning && (backlog || processed > 0)
+        state.refreshed || ((state.scanning || state.refreshing) && (backlog || processed > 0))
+    }
+
+    fn folders_idle(&self) -> bool {
+        !self.source.scanning
+            && !self.target.scanning
+            && !self.source.refreshing
+            && !self.target.refreshing
+    }
+
+    fn poll_destination_refresh(&mut self) {
+        if !self.syncing {
+            self.dest_refresh_at = None;
+            return;
+        }
+        if self.source.refreshing || self.target.refreshing {
+            return;
+        }
+        let now = Instant::now();
+        match self.dest_refresh_at {
+            Some(due) if now < due => return,
+            Some(_) => {}
+            None => {
+                self.dest_refresh_at = Some(now + DEST_REFRESH_EVERY);
+                return;
+            }
+        }
+        let mut started = false;
+        for pane in sync_destinations(self.syncing_method) {
+            if self.pane(*pane).root.is_some() && !self.pane(*pane).scanning {
+                self.start_refresh(*pane);
+                started = true;
+            }
+        }
+        if started {
+            self.dest_refresh_at = None;
+        } else {
+            self.dest_refresh_at = Some(now + DEST_REFRESH_EVERY);
+        }
+    }
+
+    fn start_refresh(&mut self, pane: ActivePane) {
+        let path = match self.pane(pane).root.clone() {
+            Some(path) if !self.pane(pane).scanning && !self.pane(pane).refreshing => path,
+            _ => return,
+        };
+        let same_file_system = self.pane(pane).volume.is_some();
+        let state = self.pane_mut(pane);
+        if let Some(cancel) = state.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        state.cancel = Some(Arc::clone(&cancel));
+        state.refreshing = true;
+        state.pass = state.pass.saturating_add(1);
+        let (tx, rx) = unbounded();
+        state.scan_rx = Some(rx);
+        scan_root_async(path, Arc::clone(&self.filter), tx, cancel, same_file_system);
     }
 
     fn partner_highlight_rel(&self, pane: ActivePane) -> Option<Vec<String>> {
@@ -496,7 +668,7 @@ impl RsyncStatApp {
     }
 
     fn start_sync(&mut self) {
-        if self.syncing || self.source.scanning || self.target.scanning {
+        if self.syncing || !self.folders_idle() {
             return;
         }
         let (Some(root_a), Some(root_b)) = (self.source.root.clone(), self.target.root.clone())
@@ -521,6 +693,8 @@ impl RsyncStatApp {
         let cancel = Arc::new(AtomicBool::new(false));
         self.sync_cancel = Some(Arc::clone(&cancel));
         self.syncing = true;
+        self.syncing_method = self.sync_method;
+        self.dest_refresh_at = Some(Instant::now() + DEST_REFRESH_EVERY);
         self.recovery_lines.clear();
         let (tx, rx) = unbounded();
         self.sync_rx = Some(rx);
@@ -750,9 +924,11 @@ impl eframe::App for RsyncStatApp {
                 {
                     self.apply_excludes();
                 }
+            });
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
-                        !self.syncing && !self.source.scanning && !self.target.scanning,
+                        !self.syncing && self.folders_idle(),
                         egui::Button::new("Run sync"),
                     )
                     .clicked()
@@ -809,11 +985,15 @@ impl eframe::App for RsyncStatApp {
         egui::Panel::bottom("status").show(ui, |ui| {
             if self.source.scanning {
                 ui::scan_status_line(ui, "A", self.source.current_scan_path.as_ref());
+            } else if self.source.refreshing {
+                ui.label(format!("A refreshing · {}", self.source.idle_status));
             } else {
                 ui.label(&self.source.idle_status);
             }
             if self.dual_pane && self.target.scanning {
                 ui::scan_status_line(ui, "B", self.target.current_scan_path.as_ref());
+            } else if self.dual_pane && self.target.refreshing {
+                ui.label(format!("B refreshing · {}", self.target.idle_status));
             } else if self.dual_pane {
                 ui.label(&self.target.idle_status);
             }
@@ -1041,6 +1221,8 @@ impl RsyncStatApp {
             if scanning {
                 let pass = self.pane(pane).pass;
                 ui.weak(format!("reading directories · pass {pass}"));
+            } else if self.pane(pane).refreshing {
+                ui.weak("refreshing");
             }
         });
         ui.separator();
@@ -1149,5 +1331,73 @@ fn format_bytes(n: u64) -> String {
         format!("{:.2} KiB", n / K)
     } else {
         format!("{n:.0} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_entry(rel: &str, size: u64) -> rsyncstat_scan::ScanEntry {
+        rsyncstat_scan::ScanEntry {
+            rel: PathBuf::from(rel),
+            size,
+            is_dir: false,
+            excluded: false,
+            rule: None,
+        }
+    }
+
+    #[test]
+    fn refresh_keeps_files_already_on_the_map() {
+        let mut pane = PaneState::new("idle");
+        pane.tree = Some(TreeNode::new_dir("target"));
+        pane.apply_batch(vec![file_entry("keep.txt", 5)]);
+        pane.apply_refresh_batch(vec![
+            file_entry("keep.txt.rsyncstat-tmp", 9),
+            file_entry("copied.txt", 4),
+        ]);
+        let tree = pane.tree.as_ref().unwrap();
+        assert_eq!(tree.child("keep.txt").map(|node| node.size), Some(5));
+        assert!(tree.child("keep.txt.rsyncstat-tmp").is_none());
+        assert_eq!(tree.child("copied.txt").map(|node| node.size), Some(4));
+        assert_eq!(tree.size, 9);
+    }
+
+    #[test]
+    fn refresh_scan_does_not_replace_the_visible_tree() {
+        let mut pane = PaneState::new("idle");
+        pane.tree = Some(TreeNode::new_dir("target"));
+        pane.apply_batch(vec![file_entry("keep.txt", 5)]);
+        pane.refreshing = true;
+        let (tx, rx) = unbounded();
+        tx.send(ScanUpdate::Started {
+            root_name: "replaced".into(),
+        })
+        .unwrap();
+        tx.send(ScanUpdate::Batch(vec![file_entry("copied.txt", 2)]))
+            .unwrap();
+        tx.send(ScanUpdate::Finished).unwrap();
+        drop(tx);
+        pane.scan_rx = Some(rx);
+        let ctx = egui::Context::default();
+        assert!(RsyncStatApp::poll_pane(&mut pane, &ctx));
+        let tree = pane.tree.as_ref().unwrap();
+        assert_eq!(tree.name, "target");
+        assert_eq!(tree.child("keep.txt").map(|node| node.size), Some(5));
+        assert_eq!(tree.child("copied.txt").map(|node| node.size), Some(2));
+        assert!(!pane.refreshing);
+        assert!(pane.refreshed);
+        assert!(pane.scan_rx.is_none());
+    }
+
+    #[test]
+    fn sync_destinations_follow_the_copy_direction() {
+        assert_eq!(sync_destinations(SyncMethod::AtoB), &[ActivePane::Target]);
+        assert_eq!(sync_destinations(SyncMethod::BtoA), &[ActivePane::Source]);
+        assert_eq!(
+            sync_destinations(SyncMethod::BothWays),
+            &[ActivePane::Source, ActivePane::Target]
+        );
     }
 }

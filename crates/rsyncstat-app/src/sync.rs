@@ -15,6 +15,8 @@ use std::thread;
 use std::time::Duration;
 
 const COPY_ATTEMPTS: u32 = 3;
+/// Appended to the destination file name while bytes are copied, then removed on rename.
+pub const COPY_TEMP_SUFFIX: &str = ".rsyncstat-tmp";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncMethod {
@@ -523,7 +525,7 @@ fn copy_rel(from_root: &Path, to_root: &Path, rel: &str) -> io::Result<u64> {
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name"))?
         .to_os_string();
-    tmp_name.push(".rsyncstat-tmp");
+    tmp_name.push(COPY_TEMP_SUFFIX);
     let tmp = to.with_file_name(tmp_name);
     let bytes = match fs::copy(&from, &tmp) {
         Ok(bytes) => bytes,
