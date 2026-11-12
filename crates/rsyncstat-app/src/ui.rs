@@ -388,12 +388,7 @@ fn paint_node(
         fill_file_tile(ui, painter, rect, &node.name);
     }
 
-    maybe_partner_stroke(
-        painter,
-        rect,
-        partner_highlight_rel,
-        rel_within_root(path),
-    );
+    maybe_partner_stroke(painter, rect, partner_highlight_rel, rel_within_root(path));
     track_pointer(ui, rect, path, parent_id, selected, hover);
 }
 
