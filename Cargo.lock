@@ -2933,6 +2933,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "eframe",
+ "libc",
  "rfd",
  "rsyncstat-filter",
  "rsyncstat-model",

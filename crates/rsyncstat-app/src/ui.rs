@@ -1,6 +1,7 @@
 //! Tree, treemap, legend, and status widgets.
 
 use crate::sync::{self, MatchKind};
+use crate::volume::SpaceTile;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use rsyncstat_model::{elide_path_for_width, file_type_bucket, TreeNode};
 use rsyncstat_treemap::squarify_indices;
@@ -15,6 +16,8 @@ pub fn rel_within_root(path: &[String]) -> Vec<String> {
 pub struct TreemapCtx<'a> {
     pub selected: &'a mut Option<Vec<String>>,
     pub hover: &'a mut Option<Vec<String>>,
+    /// Caption for the free-space or drive-gap tile under the pointer.
+    pub space_hover: &'a mut Option<String>,
     /// Relative path highlighted because the user hovered the matching entry in the other pane.
     pub partner_highlight_rel: Option<Vec<String>>,
 }
@@ -29,6 +32,8 @@ const TYPE_COLORS: &[Color32] = &[
     Color32::from_rgb(200, 100, 100),
     Color32::from_rgb(140, 140, 140),
 ];
+
+const FREE_COLOR: Color32 = Color32::from_rgb(118, 130, 146);
 
 fn type_color(bucket: &str) -> Color32 {
     let h = bucket
@@ -226,10 +231,14 @@ pub fn treemap_view(
     pane_id: egui::Id,
     live: bool,
     other_files: Option<&HashMap<String, u64>>,
+    space: &[SpaceTile],
 ) {
-    let available = ui.available_size();
-    let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
-    let rect = response.rect;
+    let visible = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    if visible.width() < 2.0 || visible.height() < 2.0 {
+        return;
+    }
+    let (response, painter) = ui.allocate_painter(visible.size(), Sense::click_and_drag());
+    let rect = response.rect.intersect(ui.clip_rect());
     if rect.width() < 2.0 || rect.height() < 2.0 {
         return;
     }
@@ -238,6 +247,7 @@ pub fn treemap_view(
     let levels = if live { 2 } else { 32 };
     let mut path = vec![root.name.clone()];
     let partner = ctx.partner_highlight_rel.as_deref();
+    *ctx.space_hover = None;
     paint_children(
         ui,
         &painter,
@@ -246,11 +256,13 @@ pub fn treemap_view(
         rect,
         ctx.selected,
         ctx.hover,
+        ctx.space_hover,
         pane_id.with(response.id),
         levels,
         live,
         partner,
         other_files,
+        space,
     );
 }
 
@@ -280,13 +292,18 @@ fn paint_children(
     rect: Rect,
     selected: &mut Option<Vec<String>>,
     hover: &mut Option<Vec<String>>,
+    space_hover: &mut Option<String>,
     parent_id: egui::Id,
     levels: usize,
     live: bool,
     partner_highlight_rel: Option<&[String]>,
     other_files: Option<&HashMap<String, u64>>,
+    extras: &[SpaceTile],
 ) {
-    let values = layout_values(&parent.children, live);
+    let mut values = layout_values(&parent.children, live);
+    for extra in extras {
+        values.push(extra.bytes() as f64);
+    }
     let layout = squarify_indices(
         &values,
         rect.left(),
@@ -295,11 +312,23 @@ fn paint_children(
         rect.height(),
     );
     for item in layout {
-        let child = &parent.children[item.item];
         let tile = Rect::from_min_size(
             Pos2::new(item.rect.x, item.rect.y),
             Vec2::new(item.rect.w, item.rect.h),
         );
+        if item.item >= parent.children.len() {
+            paint_space_tile(
+                ui,
+                painter,
+                tile,
+                extras[item.item - parent.children.len()],
+                parent_id,
+                hover,
+                space_hover,
+            );
+            continue;
+        }
+        let child = &parent.children[item.item];
         path.push(child.name.clone());
         paint_node(
             ui,
@@ -309,6 +338,7 @@ fn paint_children(
             tile,
             selected,
             hover,
+            space_hover,
             parent_id,
             levels,
             live,
@@ -327,6 +357,7 @@ fn paint_node(
     rect: Rect,
     selected: &mut Option<Vec<String>>,
     hover: &mut Option<Vec<String>>,
+    space_hover: &mut Option<String>,
     parent_id: egui::Id,
     levels: usize,
     live: bool,
@@ -362,6 +393,7 @@ fn paint_node(
             parent_id,
             selected,
             hover,
+            space_hover,
             &rel,
             node,
             mark,
@@ -376,11 +408,13 @@ fn paint_node(
                 inner,
                 selected,
                 hover,
+                space_hover,
                 parent_id,
                 levels - 1,
                 live,
                 partner_highlight_rel,
                 other_files,
+                &[],
             );
         }
     } else if node.is_dir {
@@ -410,6 +444,7 @@ fn paint_node(
             parent_id,
             selected,
             hover,
+            space_hover,
             &rel,
             node,
             mark,
@@ -434,6 +469,78 @@ fn maybe_partner_stroke(
     }
 }
 
+pub fn space_legend(ui: &mut egui::Ui, tiles: &[SpaceTile]) {
+    for tile in tiles {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::hover());
+            match tile {
+                SpaceTile::Free(_) => {
+                    ui.painter().rect_filled(rect, 2.0, FREE_COLOR);
+                }
+                SpaceTile::Gap(_) => {
+                    ui.painter().rect_stroke(
+                        rect,
+                        2.0,
+                        Stroke::new(1.0, Color32::from_gray(160)),
+                        StrokeKind::Inside,
+                    );
+                }
+            }
+            ui.label(space_caption(*tile));
+        });
+    }
+}
+
+fn paint_space_tile(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    tile: SpaceTile,
+    parent_id: egui::Id,
+    hover: &mut Option<Vec<String>>,
+    space_hover: &mut Option<String>,
+) {
+    if rect.width() < 2.0 || rect.height() < 2.0 {
+        return;
+    }
+    match tile {
+        SpaceTile::Free(_) => {
+            painter.rect_filled(rect.shrink(1.0), 2.0, FREE_COLOR);
+        }
+        SpaceTile::Gap(_) => {
+            painter.rect_stroke(
+                rect.shrink(2.0),
+                0.0,
+                Stroke::new(1.0, Color32::from_gray(90)),
+                StrokeKind::Inside,
+            );
+        }
+    }
+    let id = parent_id.with(match tile {
+        SpaceTile::Free(_) => "free-space",
+        SpaceTile::Gap(_) => "size-gap",
+    });
+    let interact = ui.interact(rect, id, Sense::hover());
+    if interact.hovered() {
+        *hover = None;
+        let caption = space_caption(tile);
+        *space_hover = Some(caption.clone());
+        interact.on_hover_text(caption);
+    }
+}
+
+fn space_caption(tile: SpaceTile) -> String {
+    match tile {
+        SpaceTile::Free(bytes) => format!("Free space — {} remaining", format_size(bytes)),
+        SpaceTile::Gap(bytes) => {
+            format!(
+                "Empty — {} smaller than the other drive",
+                format_size(bytes)
+            )
+        }
+    }
+}
+
 fn match_color(kind: MatchKind) -> Color32 {
     match kind {
         MatchKind::Same => Color32::from_rgb(90, 220, 130),
@@ -448,6 +555,7 @@ fn track_pointer(
     parent_id: egui::Id,
     selected: &mut Option<Vec<String>>,
     hover: &mut Option<Vec<String>>,
+    space_hover: &mut Option<String>,
     rel: &str,
     node: &TreeNode,
     mark: Option<MatchKind>,
@@ -457,6 +565,7 @@ fn track_pointer(
     let interact = ui.interact(rect, id, Sense::click());
     if interact.hovered() {
         *hover = Some(path.to_vec());
+        *space_hover = None;
         interact
             .clone()
             .on_hover_text(hover_tip(rel, node, mark, other_compared));

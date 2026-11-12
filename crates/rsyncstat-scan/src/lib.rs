@@ -47,7 +47,7 @@ pub enum ScanUpdate {
 pub fn scan_root(root: &Path, filter: &FilterSet) -> io::Result<TreeNode> {
     let (tx, rx) = crossbeam_channel::unbounded();
     let cancel = Arc::new(AtomicBool::new(false));
-    scan_streaming(root, filter, tx, cancel)?;
+    scan_streaming(root, filter, tx, cancel, false)?;
     let mut tree = None;
     while let Ok(update) = rx.recv() {
         match update {
@@ -85,9 +85,12 @@ pub fn scan_root_async(
     filter: Arc<FilterSet>,
     tx: crossbeam_channel::Sender<ScanUpdate>,
     cancel: Arc<AtomicBool>,
+    same_file_system: bool,
 ) {
     thread::spawn(move || {
-        if let Err(err) = scan_streaming(&root, filter.as_ref(), tx.clone(), cancel) {
+        if let Err(err) =
+            scan_streaming(&root, filter.as_ref(), tx.clone(), cancel, same_file_system)
+        {
             let _ = tx.send(ScanUpdate::Failed(err.to_string()));
         }
     });
@@ -104,6 +107,7 @@ fn scan_streaming(
     filter: &FilterSet,
     tx: crossbeam_channel::Sender<ScanUpdate>,
     cancel: Arc<AtomicBool>,
+    same_file_system: bool,
 ) -> io::Result<()> {
     let root = root.canonicalize()?;
     let root_name = root
@@ -121,6 +125,9 @@ fn scan_streaming(
     walker.standard_filters(false);
     walker.hidden(false);
     walker.follow_links(false);
+    // A whole-drive scan stays on that volume so another mounted disk is not
+    // pulled into the map or compared against this volume's free space.
+    walker.same_file_system(same_file_system);
     walker.threads(worker_threads());
 
     let filter_for_walk = Arc::clone(&filter);

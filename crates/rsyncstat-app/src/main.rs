@@ -2,6 +2,7 @@
 
 mod sync;
 mod ui;
+mod volume;
 
 use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use eframe::egui::{self, Sense, Vec2};
@@ -55,6 +56,10 @@ struct PaneState {
     legend: HashMap<&'static str, u64>,
     /// Relative path → size for files that are in scope. Used to highlight matches.
     file_sizes: Arc<HashMap<String, u64>>,
+    /// Set when `root` is the mount point of a whole drive.
+    volume: Option<volume::VolumeSpace>,
+    /// Hover text for a free-space or drive-gap tile. Not a path in the tree.
+    space_hover: Option<String>,
     stats: ScanStats,
     started: Instant,
     idle_status: String,
@@ -74,6 +79,8 @@ impl PaneState {
             recent_dirs: VecDeque::new(),
             legend: HashMap::new(),
             file_sizes: Arc::new(HashMap::new()),
+            volume: None,
+            space_hover: None,
             stats: ScanStats {
                 paths: 0,
                 files: 0,
@@ -151,6 +158,11 @@ impl PaneState {
         self.scan_rx = None;
         self.cancel = None;
         self.current_scan_path = None;
+        if let Some(root) = self.root.clone() {
+            if self.volume.is_some() {
+                self.volume = volume::volume_root(&root);
+            }
+        }
         if let Some(tree) = self.tree.as_mut() {
             tree.sort_children_recursive();
             self.legend = ui::collect_type_sizes(tree);
@@ -168,6 +180,10 @@ impl PaneState {
             self.stats.files,
             self.stats.excluded_dirs,
         );
+        if let Some(vol) = self.volume {
+            self.idle_status
+                .push_str(&format!(" {} free.", format_bytes(vol.available)));
+        }
     }
 }
 
@@ -238,6 +254,8 @@ impl RsyncStatApp {
         state.recent_dirs.clear();
         state.legend.clear();
         state.file_sizes = Arc::new(HashMap::new());
+        state.volume = volume::volume_root(&path);
+        state.space_hover = None;
         state.stats = ScanStats {
             paths: 0,
             files: 0,
@@ -251,7 +269,8 @@ impl RsyncStatApp {
         state.idle_status = format!("Scanning {}…", path.display());
         let (tx, rx) = unbounded();
         state.scan_rx = Some(rx);
-        scan_root_async(path, Arc::clone(&self.filter), tx, cancel);
+        let same_file_system = state.volume.is_some();
+        scan_root_async(path, Arc::clone(&self.filter), tx, cancel, same_file_system);
         self.active_pane = pane;
         self.compare = None;
         self.compare_dirty = true;
@@ -509,6 +528,18 @@ impl RsyncStatApp {
     }
 
     fn hover_status(&self) -> Option<String> {
+        if let Some(text) = self.source.space_hover.as_ref() {
+            if self.source.hover_path.is_none() {
+                return Some(format!("Hover A: {text}"));
+            }
+        }
+        if self.dual_pane {
+            if let Some(text) = self.target.space_hover.as_ref() {
+                if self.target.hover_path.is_none() && self.source.hover_path.is_none() {
+                    return Some(format!("Hover B: {text}"));
+                }
+            }
+        }
         let (label, pane, other, other_ready) = if self.source.hover_path.is_some() {
             (
                 "A",
@@ -679,6 +710,12 @@ impl eframe::App for RsyncStatApp {
             ActivePane::Source => self.target.tree.is_some(),
             ActivePane::Target => self.source.tree.is_some(),
         };
+        let active_volume = self.pane(active).volume;
+        let other_volume = match active {
+            ActivePane::Source => self.target.volume,
+            ActivePane::Target => self.source.volume,
+        };
+        let space_tiles = volume::space_tiles(active_volume, other_volume, self.dual_pane);
 
         egui::Panel::left("tree_panel")
             .resizable(true)
@@ -748,6 +785,10 @@ impl eframe::App for RsyncStatApp {
                 if !active_legend.is_empty() {
                     ui::type_legend(ui, &active_legend);
                 }
+                if !space_tiles.is_empty() {
+                    ui.add_space(4.0);
+                    ui::space_legend(ui, &space_tiles);
+                }
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -767,6 +808,7 @@ impl eframe::App for RsyncStatApp {
             let left_w = (total_w - splitter_w) * self.split_fraction.clamp(0.15, 0.85);
 
             ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 ui.allocate_ui_with_layout(
                     Vec2::new(left_w, height),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -825,7 +867,9 @@ impl RsyncStatApp {
             ActivePane::Target => "Target (B)",
         };
         let scanning = self.pane(pane).scanning;
-        ui.set_min_size(size);
+        ui.set_max_size(size);
+        let bounds = ui.max_rect();
+        ui.set_clip_rect(ui.clip_rect().intersect(bounds));
         ui.heading(title);
         ui.horizontal(|ui| {
             if ui.button("Choose folder…").clicked() {
@@ -837,7 +881,9 @@ impl RsyncStatApp {
                 }
             }
             if let Some(root) = self.pane(pane).root.as_ref() {
-                ui.label(format!("{}", root.display()));
+                let full = root.display().to_string();
+                ui.add(egui::Label::new(&full).truncate())
+                    .on_hover_text(full);
             }
             if scanning {
                 ui.weak("live");
@@ -855,13 +901,29 @@ impl RsyncStatApp {
             ActivePane::Source => self.target.tree.is_some(),
             ActivePane::Target => self.source.tree.is_some(),
         };
+        let space_tiles = volume::space_tiles(
+            self.pane(pane).volume,
+            match pane {
+                ActivePane::Source => self.target.volume,
+                ActivePane::Target => self.source.volume,
+            },
+            self.dual_pane,
+        );
 
         if let Some(ref t) = tree {
-            let (selected, hover) = match pane {
-                ActivePane::Source => (&mut self.source.selected_path, &mut self.source.hover_path),
-                ActivePane::Target => (&mut self.target.selected_path, &mut self.target.hover_path),
+            let (selected, hover, space_hover) = match pane {
+                ActivePane::Source => (
+                    &mut self.source.selected_path,
+                    &mut self.source.hover_path,
+                    &mut self.source.space_hover,
+                ),
+                ActivePane::Target => (
+                    &mut self.target.selected_path,
+                    &mut self.target.hover_path,
+                    &mut self.target.space_hover,
+                ),
             };
-            if t.children.is_empty() && scanning {
+            if t.children.is_empty() && scanning && space_tiles.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.spinner();
@@ -872,6 +934,7 @@ impl RsyncStatApp {
                 let ctx = ui::TreemapCtx {
                     selected,
                     hover,
+                    space_hover,
                     partner_highlight_rel: partner_rel,
                 };
                 ui::treemap_view(
@@ -881,6 +944,7 @@ impl RsyncStatApp {
                     pane_id,
                     scanning,
                     other_ready.then_some(other_files.as_ref()),
+                    &space_tiles,
                 );
             }
         } else if scanning {
