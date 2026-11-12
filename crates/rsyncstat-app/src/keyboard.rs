@@ -188,7 +188,7 @@ pub fn parse_access_label(raw: &str) -> ParsedLabel {
                 display.push('&');
             } else if let Some(&letter) = chars.peek() {
                 chars.next();
-                underline_index = Some(display.len());
+                underline_index = Some(display.chars().count());
                 access_key = Some(letter.to_ascii_lowercase());
                 display.push(letter);
             } else {
@@ -239,7 +239,8 @@ pub fn layout_job_for_label(
             while i < chars.len() && parsed.underline_index != Some(i) {
                 i += 1;
             }
-            job.append(&parsed.display[start..i], 0.0, base.clone());
+            let chunk: String = chars[start..i].iter().collect();
+            job.append(&chunk, 0.0, base.clone());
         }
     }
     job
