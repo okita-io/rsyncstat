@@ -603,13 +603,21 @@ mod tests {
     #[test]
     fn focus_order_runs_toolbar_then_pane_a_before_pane_b() {
         let dual = visible_tab_order(true);
-        let a_choose = dual.iter().position(|&id| id == FocusId::PaneAChoose).unwrap();
+        let a_choose = dual
+            .iter()
+            .position(|&id| id == FocusId::PaneAChoose)
+            .unwrap();
         let a_map = dual.iter().position(|&id| id == FocusId::TreemapA).unwrap();
-        let b_choose = dual.iter().position(|&id| id == FocusId::PaneBChoose).unwrap();
+        let b_choose = dual
+            .iter()
+            .position(|&id| id == FocusId::PaneBChoose)
+            .unwrap();
         assert!(a_choose < a_map);
         assert!(a_map < b_choose);
         assert!(
-            dual.iter().position(|&id| id == FocusId::OpenSourceA).unwrap()
+            dual.iter()
+                .position(|&id| id == FocusId::OpenSourceA)
+                .unwrap()
                 < dual.iter().position(|&id| id == FocusId::TreemapA).unwrap()
         );
     }
