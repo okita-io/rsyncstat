@@ -313,6 +313,8 @@ struct RsyncStatApp {
     sync_rx: Option<Receiver<SyncEvent>>,
     sync_cancel: Option<Arc<AtomicBool>>,
     syncing: bool,
+    /// Set when the user clicks Stop. Cleared when the copy thread finishes.
+    sync_stop_requested: bool,
     /// Direction captured when the sync started. The combo can change mid-run.
     syncing_method: SyncMethod,
     /// When to reread the folder that is receiving copies. `None` while a reread is in flight.
@@ -341,6 +343,7 @@ impl RsyncStatApp {
             sync_rx: None,
             sync_cancel: None,
             syncing: false,
+            sync_stop_requested: false,
             syncing_method: SyncMethod::AtoB,
             dest_refresh_at: None,
             sync_status: "Sync copies files. It does not delete extras.".to_string(),
@@ -554,8 +557,10 @@ impl RsyncStatApp {
     }
 
     fn poll_destination_refresh(&mut self) {
-        if !self.syncing {
-            self.dest_refresh_at = None;
+        if !self.syncing || self.sync_stop_requested {
+            if !self.syncing {
+                self.dest_refresh_at = None;
+            }
             return;
         }
         if self.source.refreshing || self.target.refreshing {
@@ -693,6 +698,7 @@ impl RsyncStatApp {
         let cancel = Arc::new(AtomicBool::new(false));
         self.sync_cancel = Some(Arc::clone(&cancel));
         self.syncing = true;
+        self.sync_stop_requested = false;
         self.syncing_method = self.sync_method;
         self.dest_refresh_at = Some(Instant::now() + DEST_REFRESH_EVERY);
         self.recovery_lines.clear();
@@ -704,6 +710,15 @@ impl RsyncStatApp {
             format_bytes(plan.copy_bytes())
         );
         sync::spawn_sync(root_a, root_b, plan, cancel, tx);
+    }
+
+    fn stop_sync(&mut self) {
+        let Some(cancel) = &self.sync_cancel else {
+            return;
+        };
+        cancel.store(true, Ordering::Relaxed);
+        self.sync_stop_requested = true;
+        self.sync_status = "Stopping after the current file…".to_string();
     }
 
     fn poll_sync(&mut self) -> bool {
@@ -728,6 +743,8 @@ impl RsyncStatApp {
                     keep = false;
                     self.syncing = false;
                     self.sync_cancel = None;
+                    let stopped = report.stopped || self.sync_stop_requested;
+                    self.sync_stop_requested = false;
                     let failed = if report.errors.is_empty() {
                         String::new()
                     } else {
@@ -748,11 +765,19 @@ impl RsyncStatApp {
                     } else {
                         ""
                     };
-                    self.sync_status = format!(
-                        "Sync finished — {} files, {}.{recovered}{failed}{rescan}",
-                        report.copied,
-                        format_bytes(report.bytes),
-                    );
+                    self.sync_status = if stopped {
+                        format!(
+                            "Sync stopped — {} files, {}.{rescan} Run sync to copy what is left.",
+                            report.copied,
+                            format_bytes(report.bytes),
+                        )
+                    } else {
+                        format!(
+                            "Sync finished — {} files, {}.{recovered}{failed}{rescan}",
+                            report.copied,
+                            format_bytes(report.bytes),
+                        )
+                    };
                     if report.copied > 0 {
                         if let Some(path) = self.source.root.clone() {
                             self.start_scan(ActivePane::Source, path);
@@ -767,8 +792,12 @@ impl RsyncStatApp {
                 Err(TryRecvError::Disconnected) => {
                     self.syncing = false;
                     self.sync_cancel = None;
-                    self.sync_status =
-                        "Sync stopped before it finished. Run sync again to retry.".to_string();
+                    self.sync_status = if self.sync_stop_requested {
+                        "Sync stopped. Run sync to copy what is left.".to_string()
+                    } else {
+                        "Sync stopped before it finished. Run sync again to retry.".to_string()
+                    };
+                    self.sync_stop_requested = false;
                     keep = false;
                     break;
                 }
@@ -926,11 +955,22 @@ impl eframe::App for RsyncStatApp {
                 }
             });
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(
-                        !self.syncing && self.folders_idle(),
-                        egui::Button::new("Run sync"),
-                    )
+                if self.syncing {
+                    if ui
+                        .add_enabled(
+                            !self.sync_stop_requested,
+                            egui::Button::new(if self.sync_stop_requested {
+                                "Stopping…"
+                            } else {
+                                "Stop"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.stop_sync();
+                    }
+                } else if ui
+                    .add_enabled(self.folders_idle(), egui::Button::new("Run sync"))
                     .clicked()
                 {
                     self.start_sync();

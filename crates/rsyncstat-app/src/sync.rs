@@ -106,6 +106,8 @@ pub struct SyncReport {
     /// Copies that failed once and then succeeded.
     pub recovered: u64,
     pub errors: Vec<CopyFailure>,
+    /// The user stopped the run. Files not started yet were left in place.
+    pub stopped: bool,
 }
 
 #[derive(Debug)]
@@ -342,11 +344,12 @@ pub fn execute(
         .chain(plan.b_to_a.iter().map(|op| (op, root_b, root_a, "B→A")))
     {
         if cancel.load(Ordering::Relaxed) {
+            report.stopped = true;
             break;
         }
         done += 1;
         progress(done, total, &op.rel);
-        match copy_with_retry(from_root, to_root, &op.rel, direction, &mut log) {
+        match copy_with_retry(from_root, to_root, &op.rel, direction, cancel, &mut log) {
             Ok((bytes, recovered)) => {
                 report.copied += 1;
                 report.bytes += bytes;
@@ -354,10 +357,20 @@ pub fn execute(
                     report.recovered += 1;
                 }
             }
-            Err(failure) => failed.push(failure),
+            Err(failure) => {
+                // A stop between retries is not a failed copy.
+                if failure.message == "stopped" {
+                    report.stopped = true;
+                    break;
+                }
+                failed.push(failure);
+            }
         }
     }
-    if !failed.is_empty() && !cancel.load(Ordering::Relaxed) {
+    if cancel.load(Ordering::Relaxed) {
+        report.stopped = true;
+    }
+    if !failed.is_empty() && !report.stopped {
         log(format!(
             "recovery: retrying {} failed {}",
             failed.len(),
@@ -365,6 +378,7 @@ pub fn execute(
         ));
         for failure in failed {
             if cancel.load(Ordering::Relaxed) {
+                report.stopped = true;
                 report.errors.push(failure);
                 continue;
             }
@@ -379,6 +393,7 @@ pub fn execute(
                 to_root,
                 &failure.rel,
                 failure.direction,
+                cancel,
                 &mut log,
             ) {
                 Ok((bytes, _)) => {
@@ -386,7 +401,13 @@ pub fn execute(
                     report.bytes += bytes;
                     report.recovered += 1;
                 }
-                Err(err) => report.errors.push(err),
+                Err(err) => {
+                    if err.message == "stopped" {
+                        report.stopped = true;
+                    } else {
+                        report.errors.push(err);
+                    }
+                }
             }
         }
     } else {
@@ -454,10 +475,19 @@ fn copy_with_retry(
     to_root: &Path,
     rel: &str,
     direction: &'static str,
+    cancel: &AtomicBool,
     log: &mut impl FnMut(String),
 ) -> Result<(u64, bool), CopyFailure> {
     let mut attempt = 0u32;
     loop {
+        if attempt > 0 && cancel.load(Ordering::Relaxed) {
+            return Err(CopyFailure {
+                rel: rel.to_string(),
+                direction,
+                attempts: attempt,
+                message: "stopped".to_string(),
+            });
+        }
         attempt += 1;
         match copy_rel(from_root, to_root, rel) {
             Ok(bytes) => {
@@ -473,6 +503,14 @@ fn copy_with_retry(
                     "attempt {attempt}/{COPY_ATTEMPTS} {direction} {rel}: {err}"
                 ));
                 match retry_wait(attempt, &err) {
+                    Some(_) if cancel.load(Ordering::Relaxed) => {
+                        return Err(CopyFailure {
+                            rel: rel.to_string(),
+                            direction,
+                            attempts: attempt,
+                            message: err.to_string(),
+                        });
+                    }
                     Some(wait) if !wait.is_zero() => thread::sleep(wait),
                     Some(_) => {}
                     None => {
@@ -835,6 +873,52 @@ mod tests {
             .iter()
             .any(|line| line.starts_with("recovery: retrying")));
         assert!(lines.iter().filter(|line| line.contains("attempt")).count() >= 2);
+    }
+
+    #[test]
+    fn stop_leaves_files_that_have_not_started() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rsyncstat-stop-{nanos}"));
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("one.txt"), b"one").unwrap();
+        fs::write(a.join("two.txt"), b"two").unwrap();
+        let plan = SyncPlan {
+            a_to_b: vec![
+                CopyOp {
+                    rel: "one.txt".into(),
+                    bytes: 3,
+                },
+                CopyOp {
+                    rel: "two.txt".into(),
+                    bytes: 3,
+                },
+            ],
+            ..SyncPlan::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let report = execute(
+            &a,
+            &b,
+            &plan,
+            &cancel,
+            |done, _, _| {
+                if done >= 1 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            |_| {},
+        );
+        assert!(report.stopped);
+        assert_eq!(report.copied, 1);
+        assert_eq!(fs::read(b.join("one.txt")).unwrap(), b"one");
+        assert!(!b.join("two.txt").exists());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
