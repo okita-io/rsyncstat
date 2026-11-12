@@ -63,6 +63,10 @@ struct PaneState {
     stats: ScanStats,
     started: Instant,
     idle_status: String,
+    /// How many times this pane has been scanned. Rescan always increments it.
+    pass: u32,
+    /// Directory reads that failed and were retried.
+    warnings: Vec<String>,
 }
 
 impl PaneState {
@@ -89,6 +93,8 @@ impl PaneState {
             },
             started: Instant::now(),
             idle_status: idle.to_string(),
+            pass: 0,
+            warnings: Vec::new(),
         }
     }
 
@@ -132,6 +138,23 @@ impl PaneState {
                     self.recent_dirs.pop_back();
                 }
             } else {
+                let key = entry
+                    .rel
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let seen = if entry.excluded {
+                    false
+                } else {
+                    Arc::make_mut(&mut self.file_sizes)
+                        .insert(key, entry.size)
+                        .is_some()
+                };
+                // A retry can report a path the first walk already counted.
+                if seen {
+                    continue;
+                }
                 self.stats.files += 1;
                 if entry.excluded {
                     self.stats.excluded_files += 1;
@@ -140,20 +163,11 @@ impl PaneState {
                     let name = name.to_string_lossy();
                     *self.legend.entry(file_type_bucket(&name)).or_default() += entry.size;
                 }
-                if !entry.excluded {
-                    let key = entry
-                        .rel
-                        .components()
-                        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    Arc::make_mut(&mut self.file_sizes).insert(key, entry.size);
-                }
             }
         }
     }
 
-    fn finish_scan(&mut self) {
+    fn finish_scan(&mut self, clean: bool) {
         self.scanning = false;
         self.scan_rx = None;
         self.cancel = None;
@@ -174,15 +188,35 @@ impl PaneState {
             .unwrap_or(0);
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
         let rate = self.stats.files as f64 / elapsed;
-        self.idle_status = format!(
-            "Scan complete — {} · {} files in {elapsed:.1}s ({rate:.0}/s). {} excluded directories were not entered.",
-            format_bytes(bytes),
-            self.stats.files,
-            self.stats.excluded_dirs,
-        );
+        if clean {
+            self.idle_status = format!(
+                "Scan complete (pass {}) — {} · {} files in {elapsed:.1}s ({rate:.0}/s). {} excluded directories were not entered.",
+                self.pass,
+                format_bytes(bytes),
+                self.stats.files,
+                self.stats.excluded_dirs,
+            );
+        } else {
+            self.idle_status = format!(
+                "Scan stopped early (pass {}) — {}. Press Rescan to read the directories again.",
+                self.pass,
+                format_bytes(bytes),
+            );
+        }
         if let Some(vol) = self.volume {
             self.idle_status
                 .push_str(&format!(" {} free.", format_bytes(vol.available)));
+        }
+        let unread = self
+            .warnings
+            .iter()
+            .filter(|line| line.starts_with("gave up"))
+            .count();
+        if unread > 0 {
+            self.idle_status.push_str(&format!(
+                " {unread} director{} could not be read.",
+                if unread == 1 { "y" } else { "ies" }
+            ));
         }
     }
 }
@@ -205,6 +239,8 @@ struct RsyncStatApp {
     sync_cancel: Option<Arc<AtomicBool>>,
     syncing: bool,
     sync_status: String,
+    /// Tail of the recovery log for the current sync (also written to disk).
+    recovery_lines: Vec<String>,
 }
 
 impl RsyncStatApp {
@@ -227,6 +263,14 @@ impl RsyncStatApp {
             sync_cancel: None,
             syncing: false,
             sync_status: "Sync copies files. It does not delete extras.".to_string(),
+            recovery_lines: Vec::new(),
+        }
+    }
+
+    fn push_recovery(&mut self, line: String) {
+        self.recovery_lines.push(line);
+        if self.recovery_lines.len() > 80 {
+            self.recovery_lines.remove(0);
         }
     }
 
@@ -266,7 +310,9 @@ impl RsyncStatApp {
         state.selected_path = None;
         state.hover_path = None;
         state.current_scan_path = Some(path.clone());
-        state.idle_status = format!("Scanning {}…", path.display());
+        state.pass = state.pass.saturating_add(1);
+        state.warnings.clear();
+        state.idle_status = format!("Scanning {} · pass {}…", path.display(), state.pass);
         let (tx, rx) = unbounded();
         state.scan_rx = Some(rx);
         let same_file_system = state.volume.is_some();
@@ -301,11 +347,13 @@ impl RsyncStatApp {
         if self.poll_sync() {
             ctx.request_repaint();
         }
-        if repainting && (self.source.scanning || self.target.scanning) {
+        // The scan and sync threads only wake the UI when something asks for
+        // another frame. A Rescan click happens after this poll, so `ui` also
+        // requests a frame while work is in flight.
+        if self.source.scanning || self.target.scanning || self.syncing {
             ctx.request_repaint_after(Duration::from_millis(50));
-        }
-        if self.syncing {
-            ctx.request_repaint_after(Duration::from_millis(50));
+        } else if repainting {
+            ctx.request_repaint();
         }
     }
 
@@ -341,8 +389,13 @@ impl RsyncStatApp {
                 Ok(ScanUpdate::Visiting(path)) => {
                     state.current_scan_path = Some(path);
                 }
+                Ok(ScanUpdate::Notice(message)) => {
+                    if state.warnings.len() < 20 {
+                        state.warnings.push(message);
+                    }
+                }
                 Ok(ScanUpdate::Finished) => {
-                    state.finish_scan();
+                    state.finish_scan(true);
                     keep = false;
                     break;
                 }
@@ -358,7 +411,11 @@ impl RsyncStatApp {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if state.scanning {
-                        state.finish_scan();
+                        state.warnings.push(
+                            "Scan stopped before it finished. Press Rescan to read the directories again."
+                                .into(),
+                        );
+                        state.finish_scan(false);
                     }
                     keep = false;
                     break;
@@ -464,6 +521,7 @@ impl RsyncStatApp {
         let cancel = Arc::new(AtomicBool::new(false));
         self.sync_cancel = Some(Arc::clone(&cancel));
         self.syncing = true;
+        self.recovery_lines.clear();
         let (tx, rx) = unbounded();
         self.sync_rx = Some(rx);
         self.sync_status = format!(
@@ -486,21 +544,40 @@ impl RsyncStatApp {
                     active = true;
                     self.sync_status = format!("Syncing {done}/{total} — {rel}");
                 }
+                Ok(SyncEvent::Log(line)) => {
+                    active = true;
+                    self.sync_status = line.clone();
+                    self.push_recovery(line);
+                }
                 Ok(SyncEvent::Finished(report)) => {
                     active = true;
                     keep = false;
                     self.syncing = false;
                     self.sync_cancel = None;
-                    let errors = if report.errors.is_empty() {
+                    let failed = if report.errors.is_empty() {
                         String::new()
                     } else {
-                        format!(" {} errors.", report.errors.len())
+                        let detail = report
+                            .errors
+                            .first()
+                            .map(|err| format!(" {} {}: {}.", err.direction, err.rel, err.message))
+                            .unwrap_or_default();
+                        format!(" {} still failing.{detail}", report.errors.len())
+                    };
+                    let recovered = if report.recovered > 0 {
+                        format!(" Recovered {} on retry.", report.recovered)
+                    } else {
+                        String::new()
+                    };
+                    let rescan = if report.copied > 0 {
+                        " Rescanning both folders."
+                    } else {
+                        ""
                     };
                     self.sync_status = format!(
-                        "Sync finished — {} files, {}.{} Rescanning both folders.",
+                        "Sync finished — {} files, {}.{recovered}{failed}{rescan}",
                         report.copied,
                         format_bytes(report.bytes),
-                        errors
                     );
                     if report.copied > 0 {
                         if let Some(path) = self.source.root.clone() {
@@ -516,6 +593,8 @@ impl RsyncStatApp {
                 Err(TryRecvError::Disconnected) => {
                     self.syncing = false;
                     self.sync_cancel = None;
+                    self.sync_status =
+                        "Sync stopped before it finished. Run sync again to retry.".to_string();
                     keep = false;
                     break;
                 }
@@ -707,6 +786,24 @@ impl eframe::App for RsyncStatApp {
                     plan.excluded,
                 ));
             }
+            if !self.recovery_lines.is_empty() {
+                let log_path = rsyncstat_scan::recovery_log_path();
+                let title = match &log_path {
+                    Some(path) => format!("Recovery log ({})", path.display()),
+                    None => "Recovery log".to_string(),
+                };
+                egui::CollapsingHeader::new(title)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(140.0)
+                            .show(ui, |ui| {
+                                for line in &self.recovery_lines {
+                                    ui.label(line);
+                                }
+                            });
+                    });
+            }
         });
 
         egui::Panel::bottom("status").show(ui, |ui| {
@@ -722,6 +819,14 @@ impl eframe::App for RsyncStatApp {
             }
             if let Some(hover) = self.hover_status() {
                 ui.label(hover);
+            }
+            if let Some(warning) = self.source.warnings.last() {
+                ui.weak(format!("A: {warning}"));
+            }
+            if self.dual_pane {
+                if let Some(warning) = self.target.warnings.last() {
+                    ui.weak(format!("B: {warning}"));
+                }
             }
         });
 
@@ -900,6 +1005,10 @@ impl eframe::App for RsyncStatApp {
                 );
             });
         });
+
+        if self.source.scanning || self.target.scanning || self.syncing {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
     }
 }
 
@@ -921,6 +1030,7 @@ impl RsyncStatApp {
             if ui.button("Rescan").clicked() {
                 if let Some(path) = self.pane(pane).root.clone() {
                     self.start_scan(pane, path);
+                    ui.ctx().request_repaint();
                 }
             }
             if let Some(root) = self.pane(pane).root.as_ref() {
@@ -929,7 +1039,8 @@ impl RsyncStatApp {
                     .on_hover_text(full);
             }
             if scanning {
-                ui.weak("live");
+                let pass = self.pane(pane).pass;
+                ui.weak(format!("reading directories · pass {pass}"));
             }
         });
         ui.separator();

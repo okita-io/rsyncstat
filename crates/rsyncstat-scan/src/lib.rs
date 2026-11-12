@@ -8,12 +8,17 @@ use ignore::{WalkBuilder, WalkState};
 use rsyncstat_filter::FilterSet;
 use rsyncstat_model::TreeNode;
 use std::cell::RefCell;
-use std::io;
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const READ_ATTEMPTS: u32 = 3;
+const MAX_RECOVERY_NOTES: usize = 40;
 
 const BATCH_ENTRIES: usize = 128;
 const DIR_FLUSH_AT: usize = 8;
@@ -39,6 +44,8 @@ pub enum ScanUpdate {
     Batch(Vec<ScanEntry>),
     /// Absolute path currently being visited (best-effort during parallel walk).
     Visiting(PathBuf),
+    /// A directory read failed and is being retried, or the retry gave up.
+    Notice(String),
     Finished,
     Failed(String),
 }
@@ -66,7 +73,7 @@ pub fn scan_root(root: &Path, filter: &FilterSet) -> io::Result<TreeNode> {
                     );
                 }
             }
-            ScanUpdate::Visiting(_) => {}
+            ScanUpdate::Visiting(_) | ScanUpdate::Notice(_) => {}
             ScanUpdate::Finished => break,
             ScanUpdate::Failed(message) => return Err(io::Error::other(message)),
         }
@@ -88,10 +95,20 @@ pub fn scan_root_async(
     same_file_system: bool,
 ) {
     thread::spawn(move || {
-        if let Err(err) =
-            scan_streaming(&root, filter.as_ref(), tx.clone(), cancel, same_file_system)
-        {
-            let _ = tx.send(ScanUpdate::Failed(err.to_string()));
+        let tx_fail = tx.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scan_streaming(&root, filter.as_ref(), tx, cancel, same_file_system)
+        }));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let _ = tx_fail.send(ScanUpdate::Failed(err.to_string()));
+            }
+            Err(_) => {
+                let _ = tx_fail.send(ScanUpdate::Failed(
+                    "scan stopped unexpectedly; press Rescan to try again".to_string(),
+                ));
+            }
         }
     });
 }
@@ -119,6 +136,12 @@ fn scan_streaming(
         let _ = tx.send(ScanUpdate::Finished);
         return Ok(());
     }
+
+    // Each scan gets its own id so a worker thread left over from the previous
+    // walk flushes into that walk's channel instead of this one.
+    static SCAN_IDS: AtomicU64 = AtomicU64::new(1);
+    let scan_id = SCAN_IDS.fetch_add(1, Ordering::Relaxed);
+    let faults = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
 
     let filter = Arc::new(filter.clone());
     let mut walker = WalkBuilder::new(&root);
@@ -159,6 +182,7 @@ fn scan_streaming(
             entry.metadata().map(|meta| meta.len()).unwrap_or(0)
         };
         tls_push(
+            scan_id,
             &tx_filter,
             ScanEntry {
                 rel: rel.to_path_buf(),
@@ -174,17 +198,26 @@ fn scan_streaming(
     let tx_visit = tx.clone();
     let root_visit = root.clone();
     let cancel_visit = Arc::clone(&cancel);
+    let faults_visit = Arc::clone(&faults);
     walker.build_parallel().run(move || {
         let tx_visit = tx_visit.clone();
         let root_visit = root_visit.clone();
         let cancel_visit = Arc::clone(&cancel_visit);
+        let faults_visit = Arc::clone(&faults_visit);
         Box::new(move |result| {
             if cancel_visit.load(Ordering::Relaxed) {
                 return WalkState::Quit;
             }
             let entry = match result {
                 Ok(entry) => entry,
-                Err(_) => return WalkState::Continue,
+                Err(err) => {
+                    if let Some(path) = error_path(&err) {
+                        if let Ok(mut faults) = faults_visit.lock() {
+                            faults.push(path);
+                        }
+                    }
+                    return WalkState::Continue;
+                }
             };
             let path = entry.path();
             let _ = tx_visit.try_send(ScanUpdate::Visiting(path.to_path_buf()));
@@ -196,6 +229,7 @@ fn scan_streaming(
             }
             let (is_dir, size) = entry_kind(&entry);
             tls_push(
+                scan_id,
                 &tx_visit,
                 ScanEntry {
                     rel: rel.to_path_buf(),
@@ -209,8 +243,313 @@ fn scan_streaming(
         })
     });
 
+    let pending = faults
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .drain(..)
+        .collect();
+    retry_unreadable(
+        &root,
+        filter.as_ref(),
+        &tx,
+        &cancel,
+        same_file_system,
+        scan_id,
+        pending,
+    );
+    tls_flush();
+
     let _ = tx.send(ScanUpdate::Finished);
     Ok(())
+}
+
+fn error_path(err: &ignore::Error) -> Option<PathBuf> {
+    match err {
+        ignore::Error::WithPath { path, err } => error_path(err).or_else(|| Some(path.clone())),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            error_path(err)
+        }
+        ignore::Error::Partial(errs) => errs.iter().find_map(error_path),
+        _ => None,
+    }
+}
+
+/// Read directories the first walk could not list, and record what happened.
+fn retry_unreadable(
+    root: &Path,
+    filter: &FilterSet,
+    tx: &crossbeam_channel::Sender<ScanUpdate>,
+    cancel: &AtomicBool,
+    same_file_system: bool,
+    scan_id: u64,
+    pending: Vec<PathBuf>,
+) {
+    let mut jobs: Vec<(PathBuf, u32)> = unique_paths(pending)
+        .into_iter()
+        .map(|path| (path, 0))
+        .collect();
+    if jobs.is_empty() {
+        return;
+    }
+    let root_device = device_id(root);
+    let mut notes = 0usize;
+    let mut slept_through = 0u32;
+    note(
+        tx,
+        &mut notes,
+        format!(
+            "recovery: {} director{} could not be read; retrying",
+            jobs.len(),
+            if jobs.len() == 1 { "y" } else { "ies" }
+        ),
+    );
+    while let Some((path, tried)) = jobs.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            note(
+                tx,
+                &mut notes,
+                format!("stopped retrying {}", path.display()),
+            );
+            break;
+        }
+        let attempt = tried + 1;
+        if attempt > slept_through {
+            if attempt > 1 {
+                thread::sleep(Duration::from_millis(40 * u64::from(attempt)));
+            }
+            slept_through = attempt;
+        }
+        note(
+            tx,
+            &mut notes,
+            format!("retry {attempt}/{READ_ATTEMPTS} reading {}", path.display()),
+        );
+        match reread(
+            root,
+            &path,
+            filter,
+            tx,
+            cancel,
+            same_file_system,
+            root_device,
+            scan_id,
+        ) {
+            Ok(children) => {
+                note(tx, &mut notes, format!("recovered read {}", path.display()));
+                for child in unique_paths(children) {
+                    jobs.push((child, 0));
+                }
+            }
+            Err(err) => {
+                note(
+                    tx,
+                    &mut notes,
+                    format!(
+                        "attempt {attempt}/{READ_ATTEMPTS} {}: {err}",
+                        path.display()
+                    ),
+                );
+                if attempt < READ_ATTEMPTS {
+                    jobs.push((path, attempt));
+                } else {
+                    note(
+                        tx,
+                        &mut notes,
+                        format!("gave up reading {}", path.display()),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn unique_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn note(tx: &crossbeam_channel::Sender<ScanUpdate>, sent: &mut usize, line: String) {
+    const MAX_LOG_LINES: usize = 200;
+    if *sent == MAX_LOG_LINES {
+        let line = "recovery: further directory retries omitted from the log".to_string();
+        eprintln!("rsyncstat: {line}");
+        #[cfg(not(test))]
+        {
+            let _ = append_recovery_log(&line);
+        }
+        let _ = tx.send(ScanUpdate::Notice(line));
+    }
+    *sent += 1;
+    if *sent > MAX_LOG_LINES {
+        return;
+    }
+    eprintln!("rsyncstat: {line}");
+    #[cfg(not(test))]
+    {
+        let _ = append_recovery_log(&line);
+    }
+    if *sent <= MAX_RECOVERY_NOTES {
+        let _ = tx.send(ScanUpdate::Notice(line));
+    }
+}
+
+/// Path of the on-disk recovery log, created on the first failed read or copy.
+pub fn recovery_log_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".rsyncstat").join("recovery.log"))
+}
+
+/// Append one recovery line. Returns the log path when the write succeeds.
+pub fn append_recovery_log(line: &str) -> Option<PathBuf> {
+    let path = recovery_log_path()?;
+    append_recovery_line(&path, line).ok()?;
+    Some(path)
+}
+
+fn append_recovery_line(path: &Path, line: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{line}")?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Re-read `failed`. `Ok` lists child directories that still could not be read.
+///
+/// The directory that failed the first walk is already in the tree, so it is
+/// not emitted again. Its children are.
+fn reread(
+    root: &Path,
+    failed: &Path,
+    filter: &FilterSet,
+    tx: &crossbeam_channel::Sender<ScanUpdate>,
+    cancel: &AtomicBool,
+    same_file_system: bool,
+    root_device: Option<u64>,
+    scan_id: u64,
+) -> Result<Vec<PathBuf>, String> {
+    let meta = fs::symlink_metadata(failed).map_err(|err| err.to_string())?;
+    let is_link = meta.file_type().is_symlink();
+    let is_dir = meta.is_dir() && !is_link;
+    if !is_dir {
+        emit_scanned(root, failed, filter, tx, scan_id, false, meta.len());
+        return Ok(Vec::new());
+    }
+    if crosses_devices(same_file_system, root_device, failed) {
+        return Ok(Vec::new());
+    }
+    let listed = fs::read_dir(failed).map_err(|err| err.to_string())?;
+    let mut stack = Vec::new();
+    for entry in listed {
+        match entry {
+            Ok(entry) => stack.push(entry.path()),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    let mut still_failed = Vec::new();
+    while let Some(path) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                still_failed.push(path);
+                continue;
+            }
+        };
+        let is_link = meta.file_type().is_symlink();
+        let is_dir = meta.is_dir() && !is_link;
+        let size = if is_dir { 0 } else { meta.len() };
+        emit_scanned(root, &path, filter, tx, scan_id, is_dir, size);
+        if !is_dir {
+            continue;
+        }
+        let rel = match path.strip_prefix(root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => continue,
+        };
+        if filter.verdict(&rel, true).excluded {
+            continue;
+        }
+        if crosses_devices(same_file_system, root_device, &path) {
+            continue;
+        }
+        match fs::read_dir(&path) {
+            Ok(listed) => {
+                for entry in listed {
+                    match entry {
+                        Ok(entry) => stack.push(entry.path()),
+                        Err(_) => still_failed.push(path.clone()),
+                    }
+                }
+            }
+            Err(_) => still_failed.push(path),
+        }
+    }
+    Ok(still_failed)
+}
+
+fn emit_scanned(
+    root: &Path,
+    path: &Path,
+    filter: &FilterSet,
+    tx: &crossbeam_channel::Sender<ScanUpdate>,
+    scan_id: u64,
+    is_dir: bool,
+    size: u64,
+) {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return;
+    };
+    if rel.as_os_str().is_empty() {
+        return;
+    }
+    let verdict = filter.verdict(rel, is_dir);
+    tls_push(
+        scan_id,
+        tx,
+        ScanEntry {
+            rel: rel.to_path_buf(),
+            size: if is_dir { 0 } else { size },
+            is_dir,
+            excluded: verdict.excluded,
+            rule: verdict.pattern,
+        },
+    );
+}
+
+fn crosses_devices(same_file_system: bool, root_device: Option<u64>, path: &Path) -> bool {
+    if !same_file_system {
+        return false;
+    }
+    match (root_device, device_id(path)) {
+        (Some(root_dev), Some(dev)) => dev != root_dev,
+        _ => false,
+    }
+}
+
+fn device_id(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).ok().map(|meta| meta.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 fn entry_kind(entry: &ignore::DirEntry) -> (bool, u64) {
@@ -225,6 +564,7 @@ fn entry_kind(entry: &ignore::DirEntry) -> (bool, u64) {
 }
 
 struct LocalBuf {
+    scan_id: u64,
     tx: crossbeam_channel::Sender<ScanUpdate>,
     buf: Vec<ScanEntry>,
     since: Instant,
@@ -264,17 +604,32 @@ thread_local! {
     static LOCAL: RefCell<Option<LocalBuf>> = const { RefCell::new(None) };
 }
 
-fn tls_push(tx: &crossbeam_channel::Sender<ScanUpdate>, entry: ScanEntry) {
+fn tls_push(scan_id: u64, tx: &crossbeam_channel::Sender<ScanUpdate>, entry: ScanEntry) {
     LOCAL.with(|slot| {
         let mut slot = slot.borrow_mut();
+        let stale = slot.as_ref().is_some_and(|buf| buf.scan_id != scan_id);
+        if stale {
+            if let Some(mut old) = slot.take() {
+                old.flush();
+            }
+        }
         if slot.is_none() {
             *slot = Some(LocalBuf {
+                scan_id,
                 tx: tx.clone(),
                 buf: Vec::with_capacity(BATCH_ENTRIES),
                 since: Instant::now(),
             });
         }
         slot.as_mut().unwrap().push(entry);
+    });
+}
+
+fn tls_flush() {
+    LOCAL.with(|slot| {
+        if let Some(buf) = slot.borrow_mut().as_mut() {
+            buf.flush();
+        }
     });
 }
 
@@ -329,5 +684,129 @@ mod tests {
         assert!(modules.excluded);
         assert!(modules.children.is_empty());
         assert_eq!(tree.child("wide").map(|n| n.children.len()), Some(40));
+    }
+
+    #[test]
+    fn second_scan_rereads_directories() {
+        let dir = std::env::temp_dir().join(format!(
+            "rsyncstat-rescan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let tmp = Tmp(dir.clone());
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        std::fs::write(tmp.0.join("a.txt"), b"one").unwrap();
+
+        let first = scan_root(&tmp.0, &FilterSet::default_presets()).unwrap();
+        assert_eq!(first.child("a.txt").map(|node| node.size), Some(3));
+        assert!(first.child("b.txt").is_none());
+
+        std::fs::write(tmp.0.join("b.txt"), b"four").unwrap();
+        std::fs::write(tmp.0.join("a.txt"), b"longer").unwrap();
+        let second = scan_root(&tmp.0, &FilterSet::default_presets()).unwrap();
+        assert_eq!(second.child("a.txt").map(|node| node.size), Some(6));
+        assert_eq!(second.child("b.txt").map(|node| node.size), Some(4));
+
+        std::fs::remove_file(tmp.0.join("a.txt")).unwrap();
+        let third = scan_root(&tmp.0, &FilterSet::default_presets()).unwrap();
+        assert!(third.child("a.txt").is_none());
+        assert_eq!(third.child("b.txt").map(|node| node.size), Some(4));
+    }
+
+    #[test]
+    fn recovery_line_appends_to_the_given_file() {
+        let path = std::env::temp_dir().join(format!(
+            "rsyncstat-recovery-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        append_recovery_line(&path, "attempt 1/3 notes/a.txt: busy").unwrap();
+        append_recovery_line(&path, "recovered read notes").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("attempt 1/3 notes/a.txt: busy"));
+        assert!(text.contains("recovered read notes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_is_logged_and_retried() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rsyncstat-locked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let tmp = Tmp(dir.clone());
+        let locked = tmp.0.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("secret.txt"), b"hidden").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = Restore(locked.clone());
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        scan_root_async(
+            tmp.0.clone(),
+            Arc::new(FilterSet::default_presets()),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            false,
+        );
+        let mut tree = None;
+        let mut notices = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(ScanUpdate::Started { root_name }) => tree = Some(TreeNode::new_dir(root_name)),
+                Ok(ScanUpdate::Batch(entries)) => {
+                    let tree = tree.as_mut().expect("batch before start");
+                    for entry in entries {
+                        tree.insert_scanned(
+                            &entry.rel,
+                            entry.size,
+                            entry.is_dir,
+                            entry.excluded,
+                            entry.rule,
+                        );
+                    }
+                }
+                Ok(ScanUpdate::Notice(message)) => notices.push(message),
+                Ok(ScanUpdate::Visiting(_)) => {}
+                Ok(ScanUpdate::Finished) => break,
+                Ok(ScanUpdate::Failed(message)) => panic!("{message}"),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                Err(err) => panic!("{err}"),
+            }
+        }
+        let tree = tree.expect("scan produced no tree");
+        let saw_file = tree
+            .child("locked")
+            .and_then(|node| node.child("secret.txt"))
+            .is_some();
+        let saw_retry = notices.iter().any(|line| line.contains("retry"));
+        assert!(
+            saw_file || saw_retry,
+            "expected the file or a retry notice, tree children {:?}, notices {notices:?}",
+            tree.children
+                .iter()
+                .map(|child| &child.name)
+                .collect::<Vec<_>>()
+        );
     }
 }

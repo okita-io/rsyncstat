@@ -11,6 +11,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+const COPY_ATTEMPTS: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncMethod {
@@ -85,16 +89,32 @@ pub struct CompareSummary {
     pub only_b: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyFailure {
+    pub rel: String,
+    pub direction: &'static str,
+    pub attempts: u32,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SyncReport {
     pub copied: u64,
     pub bytes: u64,
-    pub errors: Vec<String>,
+    /// Copies that failed once and then succeeded.
+    pub recovered: u64,
+    pub errors: Vec<CopyFailure>,
 }
 
 #[derive(Debug)]
 pub enum SyncEvent {
-    Progress { done: u64, total: u64, rel: String },
+    Progress {
+        done: u64,
+        total: u64,
+        rel: String,
+    },
+    /// One recovery-log line: a failed attempt, a retry, or a recovered copy.
+    Log(String),
     Finished(SyncReport),
 }
 
@@ -307,32 +327,68 @@ pub fn execute(
     plan: &SyncPlan,
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64, u64, &str),
+    mut log: impl FnMut(String),
 ) -> SyncReport {
     let total = plan.copy_count() as u64;
     let mut report = SyncReport::default();
     let mut done = 0u64;
-    for (op, from_root, to_root) in plan
+    let mut failed = Vec::new();
+    for (op, from_root, to_root, direction) in plan
         .a_to_b
         .iter()
-        .map(|op| (op, root_a, root_b))
-        .chain(plan.b_to_a.iter().map(|op| (op, root_b, root_a)))
+        .map(|op| (op, root_a, root_b, "A→B"))
+        .chain(plan.b_to_a.iter().map(|op| (op, root_b, root_a, "B→A")))
     {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         done += 1;
         progress(done, total, &op.rel);
-        match copy_rel(from_root, to_root, &op.rel) {
-            Ok(bytes) => {
+        match copy_with_retry(from_root, to_root, &op.rel, direction, &mut log) {
+            Ok((bytes, recovered)) => {
                 report.copied += 1;
                 report.bytes += bytes;
-            }
-            Err(err) => {
-                if report.errors.len() < 20 {
-                    report.errors.push(format!("{}: {err}", op.rel));
+                if recovered {
+                    report.recovered += 1;
                 }
             }
+            Err(failure) => failed.push(failure),
         }
+    }
+    if !failed.is_empty() && !cancel.load(Ordering::Relaxed) {
+        log(format!(
+            "recovery: retrying {} failed {}",
+            failed.len(),
+            if failed.len() == 1 { "copy" } else { "copies" }
+        ));
+        for failure in failed {
+            if cancel.load(Ordering::Relaxed) {
+                report.errors.push(failure);
+                continue;
+            }
+            let (from_root, to_root) = if failure.direction == "A→B" {
+                (root_a, root_b)
+            } else {
+                (root_b, root_a)
+            };
+            progress(done, total, &failure.rel);
+            match copy_with_retry(
+                from_root,
+                to_root,
+                &failure.rel,
+                failure.direction,
+                &mut log,
+            ) {
+                Ok((bytes, _)) => {
+                    report.copied += 1;
+                    report.bytes += bytes;
+                    report.recovered += 1;
+                }
+                Err(err) => report.errors.push(err),
+            }
+        }
+    } else {
+        report.errors = failed;
     }
     report
 }
@@ -345,35 +401,142 @@ pub fn spawn_sync(
     tx: crossbeam_channel::Sender<SyncEvent>,
 ) {
     std::thread::spawn(move || {
-        let report = execute(&root_a, &root_b, &plan, &cancel, |done, total, rel| {
-            let _ = tx.send(SyncEvent::Progress {
-                done,
-                total,
-                rel: rel.to_string(),
-            });
-        });
+        let tx_log = tx.clone();
+        let mut announced = false;
+        let mut logged = 0usize;
+        let report = execute(
+            &root_a,
+            &root_b,
+            &plan,
+            &cancel,
+            |done, total, rel| {
+                let _ = tx.send(SyncEvent::Progress {
+                    done,
+                    total,
+                    rel: rel.to_string(),
+                });
+            },
+            |line| {
+                const MAX_LOG_LINES: usize = 200;
+                if !announced {
+                    announced = true;
+                    if let Some(path) = rsyncstat_scan::recovery_log_path() {
+                        let header = format!("recovery log {}", path.display());
+                        write_recovery(&header, &tx_log);
+                    }
+                }
+                if logged < MAX_LOG_LINES {
+                    write_recovery(&line, &tx_log);
+                    logged += 1;
+                } else if logged == MAX_LOG_LINES {
+                    write_recovery(
+                        "recovery: further copy retries omitted from the log",
+                        &tx_log,
+                    );
+                    logged += 1;
+                }
+            },
+        );
         let _ = tx.send(SyncEvent::Finished(report));
     });
 }
 
+fn write_recovery(line: &str, tx: &crossbeam_channel::Sender<SyncEvent>) {
+    eprintln!("rsyncstat: {line}");
+    let _ = rsyncstat_scan::append_recovery_log(line);
+    let _ = tx.send(SyncEvent::Log(line.to_string()));
+}
+
+fn copy_with_retry(
+    from_root: &Path,
+    to_root: &Path,
+    rel: &str,
+    direction: &'static str,
+    log: &mut impl FnMut(String),
+) -> Result<(u64, bool), CopyFailure> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match copy_rel(from_root, to_root, rel) {
+            Ok(bytes) => {
+                if attempt > 1 {
+                    log(format!(
+                        "recovered {direction} {rel} after {attempt} attempts"
+                    ));
+                }
+                return Ok((bytes, attempt > 1));
+            }
+            Err(err) => {
+                log(format!(
+                    "attempt {attempt}/{COPY_ATTEMPTS} {direction} {rel}: {err}"
+                ));
+                match retry_wait(attempt, &err) {
+                    Some(wait) if !wait.is_zero() => thread::sleep(wait),
+                    Some(_) => {}
+                    None => {
+                        return Err(CopyFailure {
+                            rel: rel.to_string(),
+                            direction,
+                            attempts: attempt,
+                            message: err.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `Some` means try again after waiting. `None` means keep the failure.
+fn retry_wait(attempt: u32, err: &io::Error) -> Option<Duration> {
+    if attempt >= COPY_ATTEMPTS || err.kind() == io::ErrorKind::InvalidInput {
+        return None;
+    }
+    let transient = matches!(
+        err.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+    ) || matches!(err.raw_os_error(), Some(11 | 16 | 26 | 35 | 60));
+    if transient {
+        Some(Duration::from_millis(50 * u64::from(attempt)))
+    } else if attempt == 1 {
+        // One immediate retry for races (file locked, dest just created).
+        Some(Duration::ZERO)
+    } else {
+        None
+    }
+}
+
 fn copy_rel(from_root: &Path, to_root: &Path, rel: &str) -> io::Result<u64> {
-    let rel_path =
-        safe_rel(rel).ok_or_else(|| io::Error::other("refusing unsafe relative path"))?;
+    let rel_path = safe_rel(rel).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "refusing unsafe relative path")
+    })?;
     let from = from_root.join(&rel_path);
     let to = to_root.join(&rel_path);
     let parent = to
         .parent()
-        .ok_or_else(|| io::Error::other("destination has no parent"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
     fs::create_dir_all(parent)?;
     let mut tmp_name = to
         .file_name()
-        .ok_or_else(|| io::Error::other("destination has no file name"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name"))?
         .to_os_string();
     tmp_name.push(".rsyncstat-tmp");
     let tmp = to.with_file_name(tmp_name);
-    let bytes = fs::copy(&from, &tmp)?;
+    let bytes = match fs::copy(&from, &tmp) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+    };
     if to.exists() {
-        fs::remove_file(&to)?;
+        if let Err(err) = fs::remove_file(&to) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
     }
     if let Err(err) = fs::rename(&tmp, &to) {
         let _ = fs::remove_file(&tmp);
@@ -614,10 +777,76 @@ mod tests {
             ],
             ..SyncPlan::default()
         };
-        let report = execute(&a, &b, &plan, &AtomicBool::new(false), |_, _, _| {});
+        let mut lines = Vec::new();
+        let report = execute(
+            &a,
+            &b,
+            &plan,
+            &AtomicBool::new(false),
+            |_, _, _| {},
+            |line| lines.push(line),
+        );
         assert_eq!(report.copied, 1);
         assert_eq!(fs::read(b.join("sub/hello.txt")).unwrap(), b"hello");
         assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].rel, "../escape.txt");
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("unsafe relative path")));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_file_is_retried_and_logged_for_another_pass() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rsyncstat-retry-{nanos}"));
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let plan = SyncPlan {
+            a_to_b: vec![CopyOp {
+                rel: "missing.txt".into(),
+                bytes: 1,
+            }],
+            ..SyncPlan::default()
+        };
+        let mut lines = Vec::new();
+        let report = execute(
+            &a,
+            &b,
+            &plan,
+            &AtomicBool::new(false),
+            |_, _, _| {},
+            |line| lines.push(line),
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].rel, "missing.txt");
+        assert_eq!(report.errors[0].direction, "A→B");
+        assert!(report.errors[0].attempts >= 2);
+        assert!(lines
+            .iter()
+            .any(|line| line.starts_with("recovery: retrying")));
+        assert!(lines.iter().filter(|line| line.contains("attempt")).count() >= 2);
+    }
+
+    #[test]
+    fn transient_errors_wait_and_other_errors_retry_once() {
+        let busy = io::Error::from_raw_os_error(16);
+        assert_eq!(retry_wait(1, &busy), Some(Duration::from_millis(50)));
+        assert_eq!(retry_wait(2, &busy), Some(Duration::from_millis(100)));
+        assert_eq!(retry_wait(3, &busy), None);
+
+        let missing = io::Error::new(io::ErrorKind::NotFound, "gone");
+        assert_eq!(retry_wait(1, &missing), Some(Duration::ZERO));
+        assert_eq!(retry_wait(2, &missing), None);
+
+        let refused = io::Error::new(io::ErrorKind::InvalidInput, "no");
+        assert_eq!(retry_wait(1, &refused), None);
     }
 }
