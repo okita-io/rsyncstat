@@ -2,9 +2,8 @@
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use rsyncstat_model::{file_type_bucket, TreeNode};
-use rsyncstat_treemap::{squarify, LayoutItem};
-use std::collections::HashMap;
-use std::path::Path;
+use rsyncstat_treemap::squarify_indices;
+use std::collections::{HashMap, VecDeque};
 
 const TYPE_COLORS: &[Color32] = &[
     Color32::from_rgb(80, 120, 200),
@@ -63,10 +62,17 @@ pub fn tree_view_with_path(
     }
 }
 
-pub fn type_legend(ui: &mut egui::Ui, root: &TreeNode) {
-    let mut buckets: HashMap<&'static str, u64> = HashMap::new();
+pub fn collect_type_sizes(root: &TreeNode) -> HashMap<&'static str, u64> {
+    let mut buckets = HashMap::new();
     collect_buckets(root, &mut buckets);
-    let mut items: Vec<_> = buckets.into_iter().collect();
+    buckets
+}
+
+pub fn type_legend(ui: &mut egui::Ui, buckets: &HashMap<&'static str, u64>) {
+    let mut items: Vec<_> = buckets
+        .iter()
+        .map(|(name, bytes)| (*name, *bytes))
+        .collect();
     items.sort_by(|a, b| b.1.cmp(&a.1));
     for (name, bytes) in items {
         ui.horizontal(|ui| {
@@ -77,49 +83,74 @@ pub fn type_legend(ui: &mut egui::Ui, root: &TreeNode) {
     }
 }
 
-fn collect_buckets(node: &TreeNode, out: &mut HashMap<&'static str, u64>) {
-    if node.excluded {
+/// Directories the walk is inside right now. Sizes are read from the live tree,
+/// so the numbers keep moving as files in those directories are measured.
+pub fn live_directories(
+    ui: &mut egui::Ui,
+    root: Option<&TreeNode>,
+    recent: &VecDeque<String>,
+    paths: u64,
+    files: u64,
+    rate: f64,
+) {
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.heading("Scanning");
+    });
+    ui.label(format!("{paths} paths · {files} files · {rate:.0}/s"));
+    ui.add_space(4.0);
+    if recent.is_empty() {
+        ui.weak("Waiting for the first directory…");
         return;
     }
+    egui::ScrollArea::vertical()
+        .id_salt("live_dirs")
+        .max_height(168.0)
+        .show(ui, |ui| {
+            for (i, rel) in recent.iter().enumerate() {
+                let node = root.and_then(|tree| find_rel(tree, rel));
+                let excluded = node.map(|n| n.excluded).unwrap_or(false);
+                let detail = if excluded {
+                    "excluded".to_string()
+                } else {
+                    format_size(node.map(|n| n.size).unwrap_or(0))
+                };
+                let line = format!("{rel}  {detail}");
+                if i == 0 {
+                    ui.label(
+                        egui::RichText::new(format!("▸ {line}"))
+                            .strong()
+                            .color(Color32::from_rgb(150, 200, 255)),
+                    );
+                } else {
+                    ui.label(egui::RichText::new(line).small().weak());
+                }
+            }
+        });
+}
+
+fn find_rel<'a>(root: &'a TreeNode, rel: &str) -> Option<&'a TreeNode> {
+    let mut node = root;
+    for part in rel.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        node = node.child(part)?;
+    }
+    Some(node)
+}
+
+fn collect_buckets(node: &TreeNode, out: &mut HashMap<&'static str, u64>) {
     if node.is_dir {
-        for c in &node.children {
-            collect_buckets(c, out);
+        if node.excluded {
+            return;
+        }
+        for child in &node.children {
+            collect_buckets(child, out);
         }
     } else {
-        let b = file_type_bucket(&node.name);
-        *out.entry(b).or_default() += node.size;
-    }
-}
-
-#[derive(Clone)]
-struct Tile {
-    path: Vec<String>,
-    size: u64,
-    excluded: bool,
-    is_dir: bool,
-    name: String,
-    children: Vec<Tile>,
-}
-
-impl Tile {
-    fn from_node(node: &TreeNode, path: Vec<String>) -> Self {
-        let children = node
-            .children
-            .iter()
-            .map(|c| {
-                let mut p = path.clone();
-                p.push(c.name.clone());
-                Tile::from_node(c, p)
-            })
-            .collect();
-        Self {
-            name: node.name.clone(),
-            size: node.size,
-            excluded: node.excluded,
-            is_dir: node.is_dir,
-            path,
-            children,
-        }
+        let bucket = file_type_bucket(&node.name);
+        *out.entry(bucket).or_default() += node.size;
     }
 }
 
@@ -128,149 +159,206 @@ pub fn treemap_view(
     root: &TreeNode,
     selected: &mut Option<Vec<String>>,
     hover: &mut Option<Vec<String>>,
-    _fs_root: &Path,
+    live: bool,
 ) {
     let available = ui.available_size();
     let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
     let rect = response.rect;
+    if rect.width() < 2.0 || rect.height() < 2.0 {
+        return;
+    }
+    // While the walk is running, draw two levels so the map can refresh many
+    // times a second. The finished scan paints the full nesting.
+    let levels = if live { 2 } else { 32 };
+    let mut path = vec![root.name.clone()];
+    paint_children(
+        ui,
+        &painter,
+        root,
+        &mut path,
+        rect,
+        selected,
+        hover,
+        response.id,
+        levels,
+        live,
+    );
+}
 
-    let top_items: Vec<Tile> = root
-        .children
-        .iter()
-        .map(|c| Tile::from_node(c, vec![root.name.clone(), c.name.clone()]))
-        .collect();
+fn layout_values(children: &[TreeNode], live: bool) -> Vec<f64> {
+    let mut values: Vec<f64> = children.iter().map(|child| child.size as f64).collect();
+    // A single huge directory would otherwise be re-laid-out in full on every
+    // live frame. Keep the largest tiles; the finished scan draws everything.
+    const LIVE_TILES: usize = 800;
+    if live && values.len() > LIVE_TILES {
+        let mut ranked = values.clone();
+        ranked.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let cutoff = ranked[LIVE_TILES - 1];
+        for value in &mut values {
+            if *value < cutoff {
+                *value = 0.0;
+            }
+        }
+    }
+    values
+}
 
-    let top_layout = squarify(
-        &top_items,
-        |t| t.size as f64,
+fn paint_children(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    parent: &TreeNode,
+    path: &mut Vec<String>,
+    rect: Rect,
+    selected: &mut Option<Vec<String>>,
+    hover: &mut Option<Vec<String>>,
+    parent_id: egui::Id,
+    levels: usize,
+    live: bool,
+) {
+    let values = layout_values(&parent.children, live);
+    let layout = squarify_indices(
+        &values,
         rect.left(),
         rect.top(),
         rect.width(),
         rect.height(),
     );
-
-    let pointer = ui.input(|i| i.pointer.hover_pos());
-    let mut hovered: Option<Vec<String>> = None;
-
-    for item in &top_layout {
-        draw_folder_tile(ui, &painter, item, selected, &mut hovered, response.id);
-    }
-
-    if let Some(pos) = pointer {
-        if rect.contains(pos) {
-            *hover = hovered.clone();
-        }
+    for item in layout {
+        let child = &parent.children[item.item];
+        let tile = Rect::from_min_size(
+            Pos2::new(item.rect.x, item.rect.y),
+            Vec2::new(item.rect.w, item.rect.h),
+        );
+        path.push(child.name.clone());
+        paint_node(
+            ui, painter, child, path, tile, selected, hover, parent_id, levels, live,
+        );
+        path.pop();
     }
 }
 
-fn draw_folder_tile(
+fn paint_node(
     ui: &egui::Ui,
     painter: &egui::Painter,
-    item: &LayoutItem<Tile>,
+    node: &TreeNode,
+    path: &mut Vec<String>,
+    rect: Rect,
     selected: &mut Option<Vec<String>>,
     hover: &mut Option<Vec<String>>,
     parent_id: egui::Id,
+    levels: usize,
+    live: bool,
 ) {
-    let r = egui::Rect::from_min_size(
-        Pos2::new(item.rect.x, item.rect.y),
-        Vec2::new(item.rect.w, item.rect.h),
-    );
-    let node = &item.item;
-
-    if r.width() < 2.0 || r.height() < 2.0 {
+    if rect.width() < 2.0 || rect.height() < 2.0 {
         return;
     }
 
-    let border = ui.visuals().window_stroke;
-    painter.rect_stroke(r.expand(-1.0), 3.0, border, StrokeKind::Inside);
-
-    let header_h = 16.0f32.min(r.height() * 0.25);
-    painter.text(
-        r.min + Vec2::new(4.0, 12.0),
-        egui::Align2::LEFT_TOP,
-        format!("{}/", node.name),
-        egui::FontId::proportional(11.0),
-        ui.visuals().weak_text_color(),
-    );
-
-    let inner = Rect::from_min_max(
-        Pos2::new(r.min.x + 2.0, r.min.y + header_h),
-        Pos2::new(r.max.x - 2.0, r.max.y - 2.0),
-    );
+    let too_wide = live && node.children.len() > 400;
+    let nest =
+        node.is_dir && !node.excluded && !node.children.is_empty() && levels > 1 && !too_wide;
 
     if node.excluded {
-        hatch_rect(painter, r, ui.visuals().weak_text_color());
-        if r.width() > 40.0 && r.height() > 24.0 {
+        hatch_rect(painter, rect, ui.visuals().weak_text_color());
+        let title = if node.is_dir {
+            format!("{}/", node.name)
+        } else {
+            node.name.clone()
+        };
+        label_tile(ui, painter, rect, &title, "excluded");
+    } else if nest {
+        let border = ui.visuals().window_stroke;
+        painter.rect_stroke(rect.expand(-1.0), 3.0, border, StrokeKind::Inside);
+        let header_h = 16.0f32.min(rect.height() * 0.25);
+        painter.text(
+            rect.min + Vec2::new(4.0, 2.0),
+            egui::Align2::LEFT_TOP,
+            format!("{}/", node.name),
+            egui::FontId::proportional(11.0),
+            ui.visuals().weak_text_color(),
+        );
+        if rect.width() > 96.0 {
             painter.text(
-                r.center(),
-                egui::Align2::CENTER_CENTER,
-                "excluded",
+                Pos2::new(rect.max.x - 4.0, rect.min.y + 2.0),
+                egui::Align2::RIGHT_TOP,
+                format_size(node.size),
                 egui::FontId::proportional(10.0),
                 ui.visuals().weak_text_color(),
             );
         }
-    } else if !node.children.is_empty() && inner.is_positive() {
-        let kid_layout = squarify(
-            &node.children,
-            |t| t.size as f64,
-            inner.left(),
-            inner.top(),
-            inner.width(),
-            inner.height(),
+        let inner = Rect::from_min_max(
+            Pos2::new(rect.min.x + 2.0, rect.min.y + header_h),
+            Pos2::new(rect.max.x - 2.0, rect.max.y - 2.0),
         );
-        for kid in kid_layout {
-            draw_leaf_or_nested(ui, painter, &kid, selected, hover, parent_id);
+        if inner.is_positive() {
+            paint_children(
+                ui,
+                painter,
+                node,
+                path,
+                inner,
+                selected,
+                hover,
+                parent_id,
+                levels - 1,
+                live,
+            );
         }
-    } else if !node.is_dir {
-        fill_file_tile(ui, painter, inner, &node.name);
+    } else if node.is_dir {
+        painter.rect_filled(
+            rect.shrink(1.0),
+            2.0,
+            type_color(&node.name).gamma_multiply(0.85),
+        );
+        label_tile(
+            ui,
+            painter,
+            rect,
+            &format!("{}/", node.name),
+            &format_size(node.size),
+        );
+    } else {
+        fill_file_tile(ui, painter, rect, &node.name);
     }
 
-    let id = parent_id.with(node.path.join("/"));
-    let interact = ui.interact(r, id, Sense::click());
-    if interact.hovered() {
-        *hover = Some(node.path.clone());
+    track_pointer(ui, rect, path, parent_id, selected, hover);
+}
+
+fn label_tile(ui: &egui::Ui, painter: &egui::Painter, rect: Rect, title: &str, detail: &str) {
+    if rect.width() > 48.0 && rect.height() > 18.0 {
+        painter.text(
+            rect.min + Vec2::new(4.0, 2.0),
+            egui::Align2::LEFT_TOP,
+            title,
+            egui::FontId::proportional(11.0),
+            ui.visuals().text_color(),
+        );
     }
-    if interact.clicked() {
-        *selected = Some(node.path.clone());
+    if rect.width() > 48.0 && rect.height() > 32.0 {
+        painter.text(
+            rect.min + Vec2::new(4.0, 16.0),
+            egui::Align2::LEFT_TOP,
+            detail,
+            egui::FontId::proportional(10.0),
+            ui.visuals().weak_text_color(),
+        );
     }
 }
 
-fn draw_leaf_or_nested(
+fn track_pointer(
     ui: &egui::Ui,
-    painter: &egui::Painter,
-    item: &LayoutItem<Tile>,
+    rect: Rect,
+    path: &[String],
+    parent_id: egui::Id,
     selected: &mut Option<Vec<String>>,
     hover: &mut Option<Vec<String>>,
-    parent_id: egui::Id,
 ) {
-    let r = egui::Rect::from_min_size(
-        Pos2::new(item.rect.x, item.rect.y),
-        Vec2::new(item.rect.w, item.rect.h),
-    );
-    let node = &item.item;
-
-    if r.width() < 2.0 || r.height() < 2.0 {
-        return;
-    }
-
-    if node.excluded {
-        hatch_rect(painter, r, ui.visuals().weak_text_color());
-    } else if node.is_dir && !node.children.is_empty() {
-        draw_folder_tile(ui, painter, item, selected, hover, parent_id);
-        return;
-    } else if node.is_dir {
-        painter.rect_filled(r.shrink(1.0), 2.0, Color32::from_gray(60));
-    } else {
-        fill_file_tile(ui, painter, r, &node.name);
-    }
-
-    let id = parent_id.with(node.path.join("/"));
-    let interact = ui.interact(r, id, Sense::click());
+    let id = parent_id.with(path.join("/"));
+    let interact = ui.interact(rect, id, Sense::click());
     if interact.hovered() {
-        *hover = Some(node.path.clone());
+        *hover = Some(path.to_vec());
     }
     if interact.clicked() {
-        *selected = Some(node.path.clone());
+        *selected = Some(path.to_vec());
     }
 }
 

@@ -37,7 +37,7 @@ The binary is `target/release/rsyncstat` (or `rsyncstat.exe` on Windows).
 cargo run -p rsyncstat-app
 ```
 
-Use **Open folder…** to pick a root. The scanner uses all CPU cores, applies default exclude presets (including `*.lancedb`, `node_modules/`, `target/`, `.venv/`, system junk), and does not descend into excluded directories. Excluded entries appear in the tree and treemap with a hatch pattern.
+Use **Open folder…** to pick a root. The scanner uses up to two workers per CPU core, applies default exclude presets (including `*.lancedb`, `node_modules/`, `target/`, `.venv/`, system junk), and does not descend into excluded directories. The directory list and treemap fill in while the walk is still running. Excluded entries appear in the tree and treemap with a hatch pattern.
 
 ## Platform notes
 

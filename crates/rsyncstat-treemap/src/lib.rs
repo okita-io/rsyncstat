@@ -36,30 +36,15 @@ fn worst(row: &[f32], areas: &[f32], side: f32) -> f32 {
     (side2 * mx / s2).max(s2 / (side2 * mn))
 }
 
-/// Squarified treemap for items with positive `value(item)`.
-pub fn squarify<T, F>(
-    items: &[T],
-    mut value: F,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-) -> Vec<LayoutItem<T>>
-where
-    T: Clone,
-    F: FnMut(&T) -> f64,
-{
-    let mut rest: Vec<(usize, f64)> = items
+/// Squarified layout of positive values. `item` is the index into `values`.
+///
+/// Zero and negative weights are skipped. The index refers to the original slice,
+/// so callers can draw from a tree without cloning nodes.
+pub fn squarify_indices(values: &[f64], x: f32, y: f32, w: f32, h: f32) -> Vec<LayoutItem<usize>> {
+    let mut rest: Vec<(usize, f64)> = values
         .iter()
         .enumerate()
-        .filter_map(|(i, t)| {
-            let v = value(t);
-            if v > 0.0 {
-                Some((i, v))
-            } else {
-                None
-            }
-        })
+        .filter_map(|(i, v)| if *v > 0.0 { Some((i, *v)) } else { None })
         .collect();
     rest.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
@@ -102,7 +87,7 @@ where
                 let area = (*v * scale) as f32;
                 let hh = area / rw;
                 out.push(LayoutItem {
-                    item: items[*idx].clone(),
+                    item: *idx,
                     rect: Rect {
                         x: cx,
                         y: yy,
@@ -121,7 +106,7 @@ where
                 let area = (*v * scale) as f32;
                 let ww = area / rh;
                 out.push(LayoutItem {
-                    item: items[*idx].clone(),
+                    item: *idx,
                     rect: Rect {
                         x: xx,
                         y: cy,
@@ -138,6 +123,29 @@ where
     }
 
     out
+}
+
+/// Squarified treemap for items with positive `value(item)`.
+pub fn squarify<T, F>(
+    items: &[T],
+    mut value: F,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) -> Vec<LayoutItem<T>>
+where
+    T: Clone,
+    F: FnMut(&T) -> f64,
+{
+    let values: Vec<f64> = items.iter().map(|item| value(item)).collect();
+    squarify_indices(&values, x, y, w, h)
+        .into_iter()
+        .map(|li| LayoutItem {
+            item: items[li.item].clone(),
+            rect: li.rect,
+        })
+        .collect()
 }
 
 /// Map pointer position to the deepest layout item containing it.
