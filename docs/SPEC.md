@@ -75,6 +75,18 @@ None of them shows a sync as a spatial, size-weighted picture, and none of the v
 
 ## Core UX
 
+### Side-by-side source and target (A / B)
+
+The main workspace is built for comparing two roots before sync exists:
+
+- **Source (A)** on the left and **Target (B)** on the right, each with its own folder picker and parallel scan
+- Matching entries use the **same file-type color key** in both panes so grids line up conceptually by relative path
+- Hover or select in one pane draws a **counterpart highlight** in the other pane when the same relative path exists (gold outline today; M1 adds true sync-diff overlays)
+- A **draggable splitter** adjusts the relative widths; a toolbar toggle **collapses to a single pane** for one-root disk analysis
+- Treemap tiles reserve visual semantics for later diff states: only in A, only in B, changed, conflict, excluded (hatched)
+
+The directory tree and file-type legend follow the **active pane** (tabs for tree A / tree B). The status bar reports scan progress per pane (see below).
+
 ### Diff treemap
 
 In the union view a tile's area is the larger of its two sides, so items that exist on only one side still show up. Excluded items stay on the map, hatched, so you can see what the filters are keeping out of the sync.
@@ -84,6 +96,15 @@ In the union view a tile's area is the larger of its two sides, so items that ex
 - Cushion shading on tiles, as in WinDirStat, so nesting reads without borders
 - Sync state rolls up: a folder shows the share of its bytes in each state, so big changes jump out
 - Single-root mode doubles as a plain disk analyzer with reveal, trash and open-in-terminal
+
+### Scan progress status bar
+
+While a pane is scanning, the bottom status bar shows the **current path** being visited (best-effort during parallel walks):
+
+- Text is measured with **egui fonts** and uses as much width as the window allows
+- If the full path does not fit, **elide from the middle**, keeping the volume/root prefix and the deepest folders plus file name (e.g. `C:\Users\alex\…\deep\folder\file.bin`)
+- Layout **recomputes on resize**; the **full path** is always available in a hover tooltip
+- One line per pane, prefixed `A:` and `B:` when side-by-side; single-pane mode shows only the active scan line
 
 ### Plan, then run
 

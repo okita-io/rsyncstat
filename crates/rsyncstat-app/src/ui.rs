@@ -1,9 +1,22 @@
-//! Tree, treemap, and legend widgets.
+//! Tree, treemap, legend, and status widgets.
 
-use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
-use rsyncstat_model::{file_type_bucket, TreeNode};
+use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use rsyncstat_model::{elide_path_for_width, file_type_bucket, TreeNode};
 use rsyncstat_treemap::squarify_indices;
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+
+/// Path segments relative to the scanned root (excludes the root folder name).
+pub fn rel_within_root(path: &[String]) -> Vec<String> {
+    path.iter().skip(1).cloned().collect()
+}
+
+pub struct TreemapCtx<'a> {
+    pub selected: &'a mut Option<Vec<String>>,
+    pub hover: &'a mut Option<Vec<String>>,
+    /// Relative path highlighted because the user hovered the matching entry in the other pane.
+    pub partner_highlight_rel: Option<Vec<String>>,
+}
 
 const TYPE_COLORS: &[Color32] = &[
     Color32::from_rgb(80, 120, 200),
@@ -29,6 +42,7 @@ pub fn tree_view_with_path(
     path: &[String],
     selected: &mut Option<Vec<String>>,
     hover: &mut Option<Vec<String>>,
+    partner_highlight_rel: Option<&[String]>,
 ) {
     let size_text = if node.excluded {
         "(excluded)".to_string()
@@ -36,6 +50,7 @@ pub fn tree_view_with_path(
         format_size(node.size)
     };
     let suffix = if node.is_dir { "/" } else { "" };
+    let is_partner = partner_highlight_rel.map(|p| p == rel_within_root(path).as_slice());
     let label = format!("{}{suffix}  {size_text}", node.name);
 
     let response = if node.is_dir && !node.children.is_empty() {
@@ -43,7 +58,14 @@ pub fn tree_view_with_path(
             for child in &node.children {
                 let mut child_path = path.to_vec();
                 child_path.push(child.name.clone());
-                tree_view_with_path(ui, child, &child_path, selected, hover);
+                tree_view_with_path(
+                    ui,
+                    child,
+                    &child_path,
+                    selected,
+                    hover,
+                    partner_highlight_rel,
+                );
             }
         })
         .header_response
@@ -59,6 +81,13 @@ pub fn tree_view_with_path(
     }
     if node.excluded {
         hatch_rect(ui.painter(), response.rect, ui.visuals().weak_text_color());
+    } else if is_partner == Some(true) {
+        ui.painter().rect_stroke(
+            response.rect.expand(1.0),
+            2.0,
+            Stroke::new(1.5, Color32::from_rgb(255, 210, 80)),
+            StrokeKind::Outside,
+        );
     }
 }
 
@@ -140,6 +169,30 @@ fn find_rel<'a>(root: &'a TreeNode, rel: &str) -> Option<&'a TreeNode> {
     Some(node)
 }
 
+pub fn scan_status_line(ui: &mut egui::Ui, label: &str, path: Option<&PathBuf>) {
+    ui.horizontal(|ui| {
+        ui.monospace(format!("{label}:"));
+        let Some(path) = path else {
+            ui.label("—");
+            return;
+        };
+        let full = path.display().to_string();
+        let max_w = ui.available_width();
+        let font = FontId::proportional(12.0);
+        let measure = |s: &str| text_width(ui, s, &font);
+        let shown = elide_path_for_width(&full, max_w, measure);
+        let resp = ui.label(egui::RichText::new(shown).monospace());
+        resp.on_hover_text(full);
+    });
+}
+
+fn text_width(ui: &egui::Ui, text: &str, font_id: &FontId) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font_id.clone(), Color32::PLACEHOLDER)
+        .size()
+        .x
+}
+
 fn collect_buckets(node: &TreeNode, out: &mut HashMap<&'static str, u64>) {
     if node.is_dir {
         if node.excluded {
@@ -157,8 +210,8 @@ fn collect_buckets(node: &TreeNode, out: &mut HashMap<&'static str, u64>) {
 pub fn treemap_view(
     ui: &mut egui::Ui,
     root: &TreeNode,
-    selected: &mut Option<Vec<String>>,
-    hover: &mut Option<Vec<String>>,
+    ctx: TreemapCtx<'_>,
+    pane_id: egui::Id,
     live: bool,
 ) {
     let available = ui.available_size();
@@ -171,17 +224,19 @@ pub fn treemap_view(
     // times a second. The finished scan paints the full nesting.
     let levels = if live { 2 } else { 32 };
     let mut path = vec![root.name.clone()];
+    let partner = ctx.partner_highlight_rel.as_deref();
     paint_children(
         ui,
         &painter,
         root,
         &mut path,
         rect,
-        selected,
-        hover,
-        response.id,
+        ctx.selected,
+        ctx.hover,
+        pane_id.with(response.id),
         levels,
         live,
+        partner,
     );
 }
 
@@ -214,6 +269,7 @@ fn paint_children(
     parent_id: egui::Id,
     levels: usize,
     live: bool,
+    partner_highlight_rel: Option<&[String]>,
 ) {
     let values = layout_values(&parent.children, live);
     let layout = squarify_indices(
@@ -231,7 +287,17 @@ fn paint_children(
         );
         path.push(child.name.clone());
         paint_node(
-            ui, painter, child, path, tile, selected, hover, parent_id, levels, live,
+            ui,
+            painter,
+            child,
+            path,
+            tile,
+            selected,
+            hover,
+            parent_id,
+            levels,
+            live,
+            partner_highlight_rel,
         );
         path.pop();
     }
@@ -248,6 +314,7 @@ fn paint_node(
     parent_id: egui::Id,
     levels: usize,
     live: bool,
+    partner_highlight_rel: Option<&[String]>,
 ) {
     if rect.width() < 2.0 || rect.height() < 2.0 {
         return;
@@ -301,6 +368,7 @@ fn paint_node(
                 parent_id,
                 levels - 1,
                 live,
+                partner_highlight_rel,
             );
         }
     } else if node.is_dir {
@@ -320,7 +388,29 @@ fn paint_node(
         fill_file_tile(ui, painter, rect, &node.name);
     }
 
+    maybe_partner_stroke(
+        painter,
+        rect,
+        partner_highlight_rel,
+        rel_within_root(path),
+    );
     track_pointer(ui, rect, path, parent_id, selected, hover);
+}
+
+fn maybe_partner_stroke(
+    painter: &egui::Painter,
+    r: Rect,
+    partner_highlight_rel: Option<&[String]>,
+    this_rel: Vec<String>,
+) {
+    if partner_highlight_rel == Some(this_rel.as_slice()) {
+        painter.rect_stroke(
+            r.shrink(0.5),
+            2.0,
+            Stroke::new(2.0, Color32::from_rgb(255, 210, 80)),
+            StrokeKind::Outside,
+        );
+    }
 }
 
 fn label_tile(ui: &egui::Ui, painter: &egui::Painter, rect: Rect, title: &str, detail: &str) {

@@ -37,6 +37,8 @@ pub enum ScanUpdate {
         root_name: String,
     },
     Batch(Vec<ScanEntry>),
+    /// Absolute path currently being visited (best-effort during parallel walk).
+    Visiting(PathBuf),
     Finished,
     Failed(String),
 }
@@ -64,6 +66,7 @@ pub fn scan_root(root: &Path, filter: &FilterSet) -> io::Result<TreeNode> {
                     );
                 }
             }
+            ScanUpdate::Visiting(_) => {}
             ScanUpdate::Finished => break,
             ScanUpdate::Failed(message) => return Err(io::Error::other(message)),
         }
@@ -129,6 +132,7 @@ fn scan_streaming(
             return false;
         }
         let path = entry.path();
+        let _ = tx_filter.try_send(ScanUpdate::Visiting(path.to_path_buf()));
         let Ok(rel) = path.strip_prefix(&root_filter) else {
             return true;
         };
@@ -176,6 +180,7 @@ fn scan_streaming(
                 Err(_) => return WalkState::Continue,
             };
             let path = entry.path();
+            let _ = tx_visit.try_send(ScanUpdate::Visiting(path.to_path_buf()));
             let Ok(rel) = path.strip_prefix(&root_visit) else {
                 return WalkState::Continue;
             };

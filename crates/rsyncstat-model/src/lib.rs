@@ -1,8 +1,12 @@
 //! Shared scan tree model (arena-oriented layout for later milestones).
 
+mod path_display;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+
+pub use path_display::elide_path_for_width;
 
 /// Stable node identifier for future arena storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
