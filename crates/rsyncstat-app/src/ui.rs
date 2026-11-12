@@ -3,6 +3,7 @@
 use crate::sync::{self, MatchKind};
 use crate::volume::SpaceTile;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use egui_ltreeview::{Action, NodeBuilder, RowLayout, TreeView, TreeViewState};
 use rsyncstat_model::{elide_path_for_width, file_type_bucket, TreeNode};
 use rsyncstat_treemap::squarify_indices;
 use std::collections::{HashMap, VecDeque};
@@ -51,54 +52,140 @@ pub fn tree_view_with_path(
     partner_highlight_rel: Option<&[String]>,
     other_files: Option<&HashMap<String, u64>>,
 ) {
-    let size_text = if node.excluded {
-        "(excluded)".to_string()
+    let tree_id = ui.scope_id().with("directory_tree");
+    let mut state: TreeViewState<Vec<String>> =
+        TreeViewState::load(ui, tree_id).unwrap_or_default();
+    match selected {
+        Some(path) if state.selected().first() != Some(path) => {
+            state.set_one_selected(path.clone());
+        }
+        None if !state.selected().is_empty() => state.set_selected(Vec::new()),
+        _ => {}
+    }
+
+    let clip = ui.clip_rect().size();
+    let min_width = if clip.x.is_finite() {
+        clip.x.max(80.0)
     } else {
-        format_size(node.size)
+        280.0
     };
-    let suffix = if node.is_dir { "/" } else { "" };
-    let is_partner = partner_highlight_rel.map(|p| p == rel_within_root(path).as_slice());
-    let rel = rel_within_root(path).join("/");
+    let min_height = if clip.y.is_finite() {
+        clip.y.clamp(0.0, 8_000.0)
+    } else {
+        0.0
+    };
+    let (_response, actions) = TreeView::new(tree_id)
+        .allow_drag_and_drop(false)
+        .allow_multi_selection(false)
+        .fill_available_width(false)
+        .fill_available_height(false)
+        .min_width(min_width)
+        .min_height(min_height)
+        .row_layout(RowLayout::Compact)
+        .override_striped(Some(false))
+        .show_state(ui, &mut state, |builder| {
+            let mut rows = TreeRows {
+                hover,
+                partner_highlight_rel,
+                other_files,
+            };
+            add_tree_node(builder, node, path, &mut rows, true);
+        });
+    state.store(ui, tree_id);
+
+    for action in actions {
+        if let Action::SetSelected(ids) = action {
+            *selected = ids.into_iter().next();
+        }
+    }
+}
+
+struct TreeRows<'a> {
+    hover: &'a mut Option<Vec<String>>,
+    partner_highlight_rel: Option<&'a [String]>,
+    other_files: Option<&'a HashMap<String, u64>>,
+}
+
+struct TreeRowLabel {
+    text: String,
+    mark: Option<Color32>,
+    excluded: bool,
+    partner: bool,
+}
+
+fn add_tree_node(
+    builder: &mut egui_ltreeview::TreeViewBuilder<'_, Vec<String>>,
+    node: &TreeNode,
+    path: &[String],
+    rows: &mut TreeRows<'_>,
+    open_by_default: bool,
+) {
+    let id = path.to_vec();
     let mark = if node.is_dir {
         None
     } else {
-        other_files.and_then(|files| sync::match_file(&rel, node.size, files))
+        let rel = rel_within_root(path).join("/");
+        rows.other_files
+            .and_then(|files| sync::match_file(&rel, node.size, files))
+            .map(match_color)
     };
-    let mut label = egui::RichText::new(format!("{}{suffix}  {size_text}", node.name));
-    if let Some(kind) = mark {
-        label = label.color(match_color(kind));
-    }
-
-    let response = if node.is_dir && !node.children.is_empty() {
-        ui.collapsing(label, |ui| {
+    let label = TreeRowLabel {
+        text: tree_row_text(node),
+        mark,
+        excluded: node.excluded,
+        partner: rows
+            .partner_highlight_rel
+            .is_some_and(|partner| partner == rel_within_root(path).as_slice()),
+    };
+    let branch = node.is_dir && !node.children.is_empty();
+    let opened = builder.node(tree_node(id, label, rows.hover, branch, open_by_default));
+    if branch {
+        if opened {
             for child in &node.children {
                 let mut child_path = path.to_vec();
                 child_path.push(child.name.clone());
-                tree_view_with_path(
-                    ui,
-                    child,
-                    &child_path,
-                    selected,
-                    hover,
-                    partner_highlight_rel,
-                    other_files,
-                );
+                add_tree_node(builder, child, &child_path, rows, false);
             }
-        })
-        .header_response
-    } else {
-        ui.selectable_label(selected.as_ref().map(|p| p == path).unwrap_or(false), label)
-    };
+        }
+        builder.close_dir();
+    }
+}
 
-    if response.hovered() {
+fn tree_node<'a>(
+    id: Vec<String>,
+    label: TreeRowLabel,
+    hover: &'a mut Option<Vec<String>>,
+    branch: bool,
+    open_by_default: bool,
+) -> NodeBuilder<'a, Vec<String>> {
+    let path = id.clone();
+    let node = if branch {
+        NodeBuilder::dir(id)
+            .default_open(open_by_default)
+            .drop_allowed(false)
+    } else {
+        NodeBuilder::leaf(id)
+    };
+    node.label_ui(move |ui| paint_tree_row(ui, &label, &path, hover))
+}
+
+fn paint_tree_row(
+    ui: &mut egui::Ui,
+    label: &TreeRowLabel,
+    path: &[String],
+    hover: &mut Option<Vec<String>>,
+) {
+    let mut text = egui::RichText::new(&label.text);
+    if let Some(color) = label.mark {
+        text = text.color(color);
+    } else if label.excluded {
+        text = text.color(ui.visuals().weak_text_color());
+    }
+    let response = ui.add(egui::Label::new(text).selectable(false));
+    if response.hovered() || pointer_on_row(ui, response.rect) {
         *hover = Some(path.to_vec());
     }
-    if response.clicked() {
-        *selected = Some(path.to_vec());
-    }
-    if node.excluded {
-        hatch_rect(ui.painter(), response.rect, ui.visuals().weak_text_color());
-    } else if is_partner == Some(true) {
+    if label.partner {
         ui.painter().rect_stroke(
             response.rect.expand(1.0),
             2.0,
@@ -106,6 +193,26 @@ pub fn tree_view_with_path(
             StrokeKind::Outside,
         );
     }
+}
+
+fn pointer_on_row(ui: &egui::Ui, label: Rect) -> bool {
+    let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+        return false;
+    };
+    let clip = ui.clip_rect();
+    clip.contains(pointer)
+        && label.y_range().contains(pointer.y)
+        && pointer.x + 32.0 >= label.left()
+}
+
+fn tree_row_text(node: &TreeNode) -> String {
+    let size_text = if node.excluded {
+        "(excluded)".to_string()
+    } else {
+        format_size(node.size)
+    };
+    let suffix = if node.is_dir { "/" } else { "" };
+    format!("{}{suffix}  {size_text}", node.name)
 }
 
 pub fn collect_type_sizes(root: &TreeNode) -> HashMap<&'static str, u64> {
@@ -679,16 +786,34 @@ fn fill_file_tile(painter: &egui::Painter, r: Rect, name: &str) {
 }
 
 pub fn hatch_rect(painter: &egui::Painter, rect: Rect, color: Color32) {
-    painter.rect_filled(rect, 0.0, Color32::from_gray(35));
+    for shape in hatch_shapes(rect, color, 0.45) {
+        painter.add(shape);
+    }
+}
+
+/// Vertical stripes in `color`. `fill` is the opacity of the wash behind them.
+///
+/// The wash follows the theme color instead of a fixed near-black, so excluded
+/// tiles stay visible in light mode without covering labels.
+fn hatch_shapes(rect: Rect, color: Color32, fill: f32) -> Vec<egui::Shape> {
+    if !rect.is_positive() || !rect.width().is_finite() {
+        return Vec::new();
+    }
+    let mut shapes = vec![egui::Shape::rect_filled(
+        rect,
+        0.0,
+        color.gamma_multiply(fill),
+    )];
     let spacing = 6.0;
     let mut x = rect.left();
     while x < rect.right() {
-        painter.line_segment(
+        shapes.push(egui::Shape::line_segment(
             [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(1.0, color.gamma_multiply(0.6)),
-        );
+            Stroke::new(1.0, color.gamma_multiply(0.55)),
+        ));
         x += spacing;
     }
+    shapes
 }
 
 fn format_size(n: u64) -> String {
@@ -702,5 +827,124 @@ fn format_size(n: u64) -> String {
         format!("{:.1} KiB", n / K)
     } else {
         format!("{n} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_tree() -> TreeNode {
+        let mut root = TreeNode::new_dir("stories");
+        root.children.push(TreeNode::file("one.txt", 12));
+        let mut skipped = TreeNode::file("skip.bin", 40);
+        skipped.excluded = true;
+        root.children.push(skipped);
+        let mut nested = TreeNode::new_dir("chapter");
+        nested.children.push(TreeNode::file("page.txt", 3));
+        root.children.push(nested);
+        root.size = 55;
+        root
+    }
+
+    fn show_tree(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        root: &TreeNode,
+        selected: &mut Option<Vec<String>>,
+        hover: &mut Option<Vec<String>>,
+    ) {
+        let output = ctx.run_ui(input, |ui| {
+            egui::ScrollArea::both().max_height(400.0).show(ui, |ui| {
+                tree_view_with_path(
+                    ui,
+                    root,
+                    &["stories".to_string()],
+                    selected,
+                    hover,
+                    Some(&["skip.bin".to_string()]),
+                    None,
+                );
+            });
+        });
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn directory_tree_selects_and_hovers_a_row() {
+        let root = sample_tree();
+        let ctx = egui::Context::default();
+        let mut selected = None;
+        let mut hover = None;
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 480.0));
+        let base = |time: f64, events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+
+        show_tree(
+            &ctx,
+            base(0.0, Vec::new()),
+            &root,
+            &mut selected,
+            &mut hover,
+        );
+        show_tree(
+            &ctx,
+            base(1.0 / 60.0, Vec::new()),
+            &root,
+            &mut selected,
+            &mut hover,
+        );
+
+        let mut saw_hover = false;
+        let mut saw_selection = false;
+        for (step, y) in [10.0, 30.0, 50.0, 70.0].into_iter().enumerate() {
+            let pos = Pos2::new(72.0, y);
+            let time = 0.1 + step as f64 * 0.05;
+            show_tree(
+                &ctx,
+                base(time, vec![egui::Event::PointerMoved(pos)]),
+                &root,
+                &mut selected,
+                &mut hover,
+            );
+            saw_hover |= hover.is_some();
+            show_tree(
+                &ctx,
+                base(
+                    time + 0.01,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::default(),
+                        },
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::default(),
+                        },
+                    ],
+                ),
+                &root,
+                &mut selected,
+                &mut hover,
+            );
+            saw_selection |= selected
+                .as_ref()
+                .is_some_and(|path| path.first().map(String::as_str) == Some("stories"));
+        }
+
+        assert!(saw_hover, "hovering a row should report a path");
+        assert!(
+            saw_selection,
+            "clicking a row should select a path in the tree, last selection was {selected:?}"
+        );
     }
 }

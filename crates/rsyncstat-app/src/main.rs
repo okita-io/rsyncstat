@@ -322,6 +322,9 @@ struct RsyncStatApp {
     sync_status: String,
     /// Tail of the recovery log for the current sync (also written to disk).
     recovery_lines: Vec<String>,
+    /// Folder dialog started from a click. The panel itself runs after this
+    /// event returns; see `pick_folder`.
+    folder_pick: Option<(ActivePane, Receiver<Option<PathBuf>>)>,
 }
 
 impl RsyncStatApp {
@@ -348,6 +351,7 @@ impl RsyncStatApp {
             dest_refresh_at: None,
             sync_status: "Sync copies files. It does not delete extras.".to_string(),
             recovery_lines: Vec::new(),
+            folder_pick: None,
         }
     }
 
@@ -358,14 +362,40 @@ impl RsyncStatApp {
         }
     }
 
-    fn pick_folder(&mut self, pane: ActivePane) {
+    fn pick_folder(&mut self, ctx: &egui::Context, pane: ActivePane) {
+        if self.folder_pick.is_some() {
+            return;
+        }
         let title = match pane {
             ActivePane::Source => "Select source (A)",
             ActivePane::Target => "Select target (B)",
         };
-        let folder = rfd::FileDialog::new().set_title(title).pick_folder();
-        if let Some(path) = folder {
-            self.start_scan(pane, path);
+        let (tx, rx) = unbounded();
+        self.folder_pick = Some((pane, rx));
+        let ctx = ctx.clone();
+        // The open panel runs a nested AppKit modal loop. Opening it from this
+        // click keeps winit's event handler on the stack, and resizing the panel
+        // then delivers another event into that handler and aborts the process.
+        // Run it on the next turn of the main queue, after the handler returns.
+        run_after_event(move || {
+            let path = rfd::FileDialog::new().set_title(title).pick_folder();
+            let _ = tx.send(path);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_folder_pick(&mut self, ctx: &egui::Context) {
+        let Some((pane, rx)) = self.folder_pick.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Some(path)) => {
+                self.start_scan(pane, path);
+                ctx.request_repaint();
+            }
+            Ok(None) => {}
+            Err(TryRecvError::Empty) => self.folder_pick = Some((pane, rx)),
+            Err(TryRecvError::Disconnected) => {}
         }
     }
 
@@ -903,6 +933,7 @@ impl RsyncStatApp {
 
 impl eframe::App for RsyncStatApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_folder_pick(ctx);
         self.poll_scans(ctx);
     }
 
@@ -911,10 +942,10 @@ impl eframe::App for RsyncStatApp {
         egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Open source (A)…").clicked() {
-                    self.pick_folder(ActivePane::Source);
+                    self.pick_folder(ui.ctx(), ActivePane::Source);
                 }
                 if ui.button("Open target (B)…").clicked() {
-                    self.pick_folder(ActivePane::Target);
+                    self.pick_folder(ui.ctx(), ActivePane::Target);
                 }
                 ui.separator();
                 ui.checkbox(&mut self.dual_pane, "Side-by-side A | B");
@@ -1121,19 +1152,26 @@ impl eframe::App for RsyncStatApp {
                         }
                     };
                     let tree_height = (ui.available_height() - 320.0).max(100.0);
-                    egui::ScrollArea::both()
-                        .max_height(tree_height)
-                        .show(ui, |ui| {
-                            ui::tree_view_with_path(
-                                ui,
-                                t,
-                                &root_path,
-                                selected,
-                                hover,
-                                partner_rel.as_deref(),
-                                other_ready.then_some(other_files.as_ref()),
-                            );
-                        });
+                    let tree_salt = match active {
+                        ActivePane::Source => "tree-a",
+                        ActivePane::Target => "tree-b",
+                    };
+                    ui.push_id(tree_salt, |ui| {
+                        egui::ScrollArea::both()
+                            .id_salt("directory-tree")
+                            .max_height(tree_height)
+                            .show(ui, |ui| {
+                                ui::tree_view_with_path(
+                                    ui,
+                                    t,
+                                    &root_path,
+                                    selected,
+                                    hover,
+                                    partner_rel.as_deref(),
+                                    other_ready.then_some(other_files.as_ref()),
+                                );
+                            });
+                    });
                 } else if active_scanning {
                     ui.label("Starting…");
                 } else {
@@ -1245,7 +1283,7 @@ impl RsyncStatApp {
         ui.heading(title);
         ui.horizontal(|ui| {
             if ui.button("Choose folder…").clicked() {
-                self.pick_folder(pane);
+                self.pick_folder(ui.ctx(), pane);
             }
             if ui.button("Rescan").clicked() {
                 if let Some(path) = self.pane(pane).root.clone() {
@@ -1440,4 +1478,45 @@ mod tests {
             &[ActivePane::Source, ActivePane::Target]
         );
     }
+}
+
+/// Run `work` after the current window event has returned.
+///
+/// On macOS the folder panel is a nested modal loop. Starting it from inside
+/// winit's event handler makes a resize of that panel re-enter the handler,
+/// which aborts. `dispatch_async` to the main queue runs only after this
+/// event returns. Other platforms show the dialog immediately.
+fn run_after_event(work: impl FnOnce() + Send + 'static) {
+    #[cfg(target_os = "macos")]
+    {
+        let work: Box<dyn FnOnce() + Send> = Box::new(work);
+        let ctx = Box::into_raw(Box::new(work));
+        // SAFETY: `ctx` is a Box we own. The main queue calls `call_after_event`
+        // exactly once, and that function frees it. The queue pointer from
+        // `dispatch_get_main_queue` is the process-wide main queue.
+        unsafe {
+            dispatch_async_f(dispatch_get_main_queue(), ctx.cast(), call_after_event);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        work();
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn call_after_event(ctx: *mut std::ffi::c_void) {
+    // SAFETY: `dispatch_async_f` passes back the Box pointer we gave it, once.
+    let work = unsafe { Box::from_raw(ctx.cast::<Box<dyn FnOnce() + Send>>()) };
+    work();
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn dispatch_get_main_queue() -> *mut std::ffi::c_void;
+    fn dispatch_async_f(
+        queue: *mut std::ffi::c_void,
+        context: *mut std::ffi::c_void,
+        work: extern "C" fn(*mut std::ffi::c_void),
+    );
 }
