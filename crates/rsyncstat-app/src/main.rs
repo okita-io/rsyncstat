@@ -1573,11 +1573,15 @@ impl RsyncStatApp {
                 });
             } else {
                 let treemap_focused = keyboard::is_focused(&self.kbd, treemap_id);
-                let map_focus = keyboard::focus_region(
+                // Do not allocate this rect: treemap_view paints into the same
+                // space. Allocating it first left the map with no room and a
+                // blank (near-black) panel.
+                let map_rect = ui.available_rect_before_wrap();
+                let map_focus = keyboard::focus_region_at(
                     ui,
                     treemap_id,
-                    ui.available_size(),
-                    Sense::click_and_drag(),
+                    map_rect,
+                    egui::Sense::focusable_noninteractive(),
                 );
                 keyboard::paint_focus_ring(ui, map_focus.rect, treemap_focused);
                 let ctx = ui::TreemapCtx {

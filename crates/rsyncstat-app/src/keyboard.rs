@@ -307,12 +307,10 @@ pub fn mnemonic_selectable(
         .inner
 }
 
-/// Invisible focus target for treemap / splitter regions.
-pub fn focus_region(ui: &mut Ui, slot: FocusId, min_size: egui::Vec2, sense: Sense) -> Response {
-    let (rect, _response) = ui.allocate_exact_size(min_size, sense);
-    let _ = rect;
-    let id = focus_egui_id(slot);
-    ui.interact(rect, id, sense)
+/// Focus target over a rectangle that another widget will paint.
+/// Does not advance the layout cursor.
+pub fn focus_region_at(ui: &mut Ui, slot: FocusId, rect: Rect, sense: Sense) -> Response {
+    ui.interact(rect, focus_egui_id(slot), sense)
 }
 
 pub fn raw_label_for(slot: FocusId) -> &'static str {
