@@ -1,0 +1,10 @@
+[package]
+name = "rsyncstat-plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sync plan builder (stub)"
+
+[dependencies]
+rsyncstat-model = { path = "../rsyncstat-model" }

@@ -1,0 +1,10 @@
+[package]
+name = "rsyncstat-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sync executor (stub)"
+
+[dependencies]
+rsyncstat-plan = { path = "../rsyncstat-plan" }
