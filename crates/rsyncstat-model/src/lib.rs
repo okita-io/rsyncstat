@@ -1,11 +1,13 @@
 //! Shared scan tree model (arena-oriented layout for later milestones).
 
+mod file_color;
 mod path_display;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+pub use file_color::{file_color_rgb, readable_color_rgb};
 pub use path_display::elide_path_for_width;
 
 /// Stable node identifier for future arena storage.
@@ -211,7 +213,9 @@ fn insert_at(
     delta
 }
 
-/// Extension → bucket name for the type legend (WinDirStat-style, simplified for M0).
+/// Extension → category name for the type legend.
+///
+/// Tile color is separate: each extension is hashed on its own.
 pub fn file_type_bucket(name: &str) -> &'static str {
     let ext = name.rsplit('.').next().unwrap_or(name);
     match ext.to_ascii_lowercase().as_str() {
