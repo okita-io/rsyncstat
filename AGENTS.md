@@ -35,6 +35,7 @@ Rust stable 1.95+ (`rust-toolchain.toml`). Linux needs GTK/xkb dev packages, see
 Inside `rsyncstat-app/src/`:
 - `app/mod.rs` holds window state. Behavior is split by concern: `scan_ctl` (folders, scans), `sync_ctl` (compare, plan, sync), `input` (keyboard), `frame` (layout), `pane`, `pane_view`.
 - `ui/` holds widgets: `treemap`, `tree_view`, `legend`, `dither`, `diff`, `patterns`.
+- App icons: edit the master `docs/images/icon-original.png`, then run `scripts/make-icons.sh` to regenerate `assets/icon.{png,ico,icns}` and the README logo.
 - `keyboard.rs`, `files.rs`, `volume.rs`, `platform.rs` are standalone helpers.
 
 Put new logic in a library crate with tests, then call it from the app. Keep changes inside one module where you can, so parallel agents do not collide. Dependencies flow downward only; do not add cycles.

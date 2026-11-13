@@ -13,6 +13,9 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 - Dithered file map on a shared pixel grid
 - Community files, issue and PR templates, Dependabot
 
+### Added (icons)
+- App icon, plus `scripts/make-icons.sh` to build PNG, ICO and ICNS files from one master PNG
+
 ### Changed
 - Sync logic moved out of the app into `rsyncstat-plan` and `rsyncstat-exec`
 - App split into `app/` and `ui/` modules
