@@ -1,0 +1,41 @@
+# Named include/exclude packs for RSyncStat.
+# Click + next to a name in the app to append these strings to the fields.
+# Patterns use the same syntax as the include/exclude boxes (gitignore globs,
+# or regular expressions if .* is turned on).
+#
+# This file is created next to the RSyncStat binary. Edit it here, or use
+# "Add to presets…" in the app to save the current fields under a new name.
+
+presets:
+  - name: git
+    include: []
+    exclude:
+      - .git/
+  - name: node
+    include: []
+    exclude:
+      - node_modules/
+      - npm-debug.log*
+      - yarn-debug.log*
+      - yarn-error.log*
+      - .pnpm-store/
+      - .yarn/
+  - name: vite
+    include: []
+    exclude:
+      - dist/
+      - .vite/
+      - node_modules/
+  - name: rust
+    include: []
+    exclude:
+      - target/
+      - "**/*.rs.bk"
+  - name: python
+    include: []
+    exclude:
+      - __pycache__/
+      - .venv/
+      - "*.pyc"
+      - .pytest_cache/
+      - .mypy_cache/

@@ -261,6 +261,7 @@ Size and age filters are optional and apply to files only, never to folders. A f
 
 ### Filter UX
 
+- A ▾ menu on the include field lists named packs (git, node, vite, and others). **+** appends that pack's patterns to the include and exclude fields. **Add to presets…** names the current fields and writes them to `include-exclude.yaml` next to the app
 - Excluded items are hatched gray on the map and in the tree, with the total excluded size per side in the status bar
 - Excluded folders are pruned unmeasured; their size shows as not measured until you run a low-priority Measure excluded pass, or comes free from the MFT read on NTFS
 - Right-click a tile: Exclude this item, Exclude `*.ext`, or Exclude folders named this; then pick the level (profile or the nearest `.rsyncignore`)

@@ -1,5 +1,6 @@
 //! Gitignore-style exclude rules compiled with the `ignore` crate.
 
+mod named;
 mod presets;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -42,6 +43,10 @@ impl PatternOptions {
     }
 }
 
+pub use named::{
+    builtin_named_presets, builtin_preset_yaml, field_patterns, merge_field_patterns,
+    parse_preset_file, serialize_preset_file, upsert_preset, validate_preset_name, NamedPreset,
+};
 pub use presets::default_preset_rules;
 
 /// Where a matching rule came from.
@@ -536,7 +541,7 @@ pub fn gitignore_lines(include: &str, exclude: &str, use_presets: bool) -> Vec<S
     lines
 }
 
-fn split_patterns(raw: &str) -> Vec<&str> {
+pub(crate) fn split_patterns(raw: &str) -> Vec<&str> {
     raw.split([',', ';', '\n'])
         .map(str::trim)
         .filter(|token| !token.is_empty())

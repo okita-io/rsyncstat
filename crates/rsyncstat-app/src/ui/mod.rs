@@ -8,7 +8,7 @@
 use crate::volume::SpaceTile;
 use eframe::egui::{self, Color32, FontId, Mesh, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use egui_ltreeview::{Action, NodeBuilder, RowLayout, TreeView, TreeViewState};
-use rsyncstat_filter::{PatternOptions, PatternToggle};
+use rsyncstat_filter::{NamedPreset, PatternOptions, PatternToggle};
 use rsyncstat_model::{
     elide_path_for_width, file_color_rgb, file_type_id, readable_color_rgb, FileTypeId, TreeNode,
 };

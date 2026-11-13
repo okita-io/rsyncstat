@@ -4,6 +4,7 @@ mod app;
 mod files;
 mod keyboard;
 mod platform;
+mod presets;
 mod ui;
 mod volume;
 
