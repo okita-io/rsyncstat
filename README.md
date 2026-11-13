@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/images/rsyncstat-logo.png" alt="RSyncStat logo" width="128">
+
 # RSyncStat
 
 **See your folders. See your sync. One map.**

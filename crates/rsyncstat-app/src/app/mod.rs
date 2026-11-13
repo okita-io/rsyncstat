@@ -32,11 +32,18 @@ const DEST_REFRESH_EVERY: Duration = Duration::from_secs(3);
 /// Fold at most this many paths into the map on one frame.
 const REFRESH_APPLY_PER_FRAME: usize = 8_000;
 
+/// Window and dock icon, embedded at build time.
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png"))
+        .expect("assets/icon.png is a valid PNG")
+}
+
 pub fn run() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_title("RSyncStat"),
+            .with_title("RSyncStat")
+            .with_icon(app_icon()),
         // Quantized tile colors sit on whole 8-bit values. This keeps the GPU
         // pass from smoothing the in-between samples of the file-map dither.
         dithering: true,
