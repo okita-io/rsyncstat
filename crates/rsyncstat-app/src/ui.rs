@@ -2,9 +2,7 @@
 
 use crate::sync::{self, MatchKind};
 use crate::volume::SpaceTile;
-use eframe::egui::{
-    self, Color32, Direction, FontId, Mesh, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2,
-};
+use eframe::egui::{self, Color32, FontId, Mesh, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use egui_ltreeview::{Action, NodeBuilder, RowLayout, TreeView, TreeViewState};
 use rsyncstat_model::{
     elide_path_for_width, file_color_rgb, file_type_bucket, readable_color_rgb, TreeNode,
@@ -34,13 +32,18 @@ const TILE_INSET: f32 = 1.0;
 /// Nested directory contents keep this pad. It is the grey frame around the
 /// files and does not change when a glow is shown.
 const DIR_PAD: f32 = 2.0;
-/// Match glow reaches this far in from the tile edge, then fades out.
-const MATCH_GLOW_PX: f32 = 3.0;
 /// Bottom edge of each tile is this fraction of the top color, so the box
 /// shades 30% darker toward its own bottom edge.
 const TILE_SHADE: f32 = 0.7;
-/// Hover partner glow, drawn from the center of the box. Quieter than the match rim.
-const HOVER_GLOW: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 88);
+/// Same-file match. The outline is a solid line of this color, and hovering
+/// the match fills an even quarter of the cells with it.
+const MATCH_GREEN: Color32 = Color32::from_rgb(90, 220, 130);
+/// Share of cells filled by a hovered match. Flat across the box.
+const HOVER_DITHER: f32 = 0.25;
+const NO_GLOW: DitherGlows = DitherGlows {
+    outline: None,
+    hover: false,
+};
 
 fn color_from_rgb(rgb: [u8; 3]) -> Color32 {
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
@@ -363,9 +366,11 @@ pub fn treemap_view(
     *ctx.space_hover = None;
     // The scanned root is the box top-level files sit in. Grey, no outline.
     painter.rect_filled(rect, 0.0, directory_grey(ui.visuals().dark_mode, 0));
+    let grid = map_grid(rect, painter.pixels_per_point());
     paint_children(
         ui,
         &painter,
+        &grid,
         root,
         &mut path,
         rect,
@@ -437,6 +442,7 @@ fn hidden_excluded_bytes(node: &TreeNode) -> u64 {
 fn paint_children(
     ui: &egui::Ui,
     painter: &egui::Painter,
+    grid: &MapGrid,
     parent: &TreeNode,
     path: &mut Vec<String>,
     rect: Rect,
@@ -472,6 +478,7 @@ fn paint_children(
             paint_space_tile(
                 ui,
                 painter,
+                grid,
                 tile,
                 extras[item.item - parent.children.len()],
                 parent_id,
@@ -485,6 +492,7 @@ fn paint_children(
         paint_node(
             ui,
             painter,
+            grid,
             child,
             path,
             tile,
@@ -506,6 +514,7 @@ fn paint_children(
 fn paint_node(
     ui: &egui::Ui,
     painter: &egui::Painter,
+    grid: &MapGrid,
     node: &TreeNode,
     path: &mut Vec<String>,
     rect: Rect,
@@ -527,7 +536,9 @@ fn paint_node(
     let too_wide = live && node.children.len() > 400;
     let nest =
         node.is_dir && !node.excluded && !node.children.is_empty() && levels > 1 && !too_wide;
-    let rel = rel_within_root(path).join("/");
+    let this_rel = rel_within_root(path);
+    let rel = this_rel.join("/");
+    let partner_here = partner_highlight_rel == Some(this_rel.as_slice());
     let mark = if node.is_dir {
         None
     } else {
@@ -560,6 +571,7 @@ fn paint_node(
             paint_children(
                 ui,
                 painter,
+                grid,
                 node,
                 path,
                 inner,
@@ -579,25 +591,40 @@ fn paint_node(
     } else if node.is_dir {
         paint_tile_gradient(
             painter,
+            grid,
             tile,
             color_from_rgb(readable_color_rgb(&node.name)).gamma_multiply(0.85),
+            &DitherGlows {
+                outline: None,
+                hover: partner_here,
+            },
         );
     } else {
-        paint_tile_gradient(painter, tile, color_from_rgb(file_color_rgb(&node.name)));
-        if let Some(kind) = mark {
-            if let Some(mesh) = inset_glow_mesh(tile, match_color(kind), MATCH_GLOW_PX) {
-                painter.add(mesh);
-            }
-        }
+        paint_tile_gradient(
+            painter,
+            grid,
+            tile,
+            color_from_rgb(file_color_rgb(&node.name)),
+            &DitherGlows {
+                outline: mark.map(match_color),
+                hover: partner_here,
+            },
+        );
     }
 
-    let glow_rect = if nest { rect } else { tile };
-    maybe_partner_glow(
-        painter,
-        glow_rect,
-        partner_highlight_rel,
-        rel_within_root(path),
-    );
+    // A nested folder and an excluded file have no dither fill of their own.
+    // The hover still stipples the same Bayer cells on top of what is there.
+    if (nest || node.excluded) && partner_here {
+        paint_dither_overlay(
+            painter,
+            grid,
+            if nest { rect } else { tile },
+            &DitherGlows {
+                outline: None,
+                hover: true,
+            },
+        );
+    }
     if !nest {
         track_pointer(
             ui,
@@ -612,19 +639,6 @@ fn paint_node(
             mark,
             other_files.is_some(),
         );
-    }
-}
-
-fn maybe_partner_glow(
-    painter: &egui::Painter,
-    rect: Rect,
-    partner_highlight_rel: Option<&[String]>,
-    this_rel: Vec<String>,
-) {
-    if partner_highlight_rel == Some(this_rel.as_slice()) {
-        if let Some(mesh) = radial_glow_mesh(rect, HOVER_GLOW) {
-            painter.add(mesh);
-        }
     }
 }
 
@@ -715,6 +729,7 @@ pub fn space_legend(ui: &mut egui::Ui, tiles: &[SpaceTile]) {
 fn paint_space_tile(
     ui: &egui::Ui,
     painter: &egui::Painter,
+    grid: &MapGrid,
     rect: Rect,
     tile: SpaceTile,
     parent_id: egui::Id,
@@ -726,7 +741,7 @@ fn paint_space_tile(
     }
     match tile {
         SpaceTile::Free(_) => {
-            paint_tile_gradient(painter, rect.shrink(TILE_INSET), FREE_COLOR);
+            paint_tile_gradient(painter, grid, rect.shrink(TILE_INSET), FREE_COLOR, &NO_GLOW);
         }
         SpaceTile::Gap(_) | SpaceTile::ContentGap(_) => {
             painter.rect_stroke(
@@ -771,7 +786,7 @@ fn space_caption(tile: SpaceTile) -> String {
 
 fn match_color(kind: MatchKind) -> Color32 {
     match kind {
-        MatchKind::Same => Color32::from_rgb(90, 220, 130),
+        MatchKind::Same => MATCH_GREEN,
         MatchKind::Different => Color32::from_rgb(240, 170, 60),
     }
 }
@@ -835,18 +850,202 @@ fn hover_tip(rel: &str, node: &TreeNode, mark: Option<MatchKind>, other_compared
     }
 }
 
+/// Ordered-dither steps between the tile color and a 30% darker shade.
+const DITHER_LEVELS: u8 = 5;
+/// One rendered pixel is this many device pixels in every box.
+const MAP_PIXEL_PX: i32 = 6;
+/// On a large pane the pixel grows so the shorter side stays near this many
+/// rendered pixels, stretched to the pane.
+const MAP_SHORT_SIDE_PX: f32 = 800.0;
+
+/// Shared pixel lattice for one file map. Every box steps by `cell_px`.
+struct MapGrid {
+    pixels_per_point: f32,
+    cell_px: i32,
+    origin_x: i32,
+    origin_y: i32,
+}
+
+fn map_grid(rect: Rect, pixels_per_point: f32) -> MapGrid {
+    let pixels_per_point = pixels_per_point.max(1.0);
+    let short_side = rect.width().min(rect.height()) * pixels_per_point;
+    MapGrid {
+        pixels_per_point,
+        cell_px: map_cell_px(short_side),
+        origin_x: (rect.left() * pixels_per_point).round() as i32,
+        origin_y: (rect.top() * pixels_per_point).round() as i32,
+    }
+}
+
+fn map_cell_px(short_side_px: f32) -> i32 {
+    let stretched = (short_side_px / MAP_SHORT_SIDE_PX).round().max(1.0) as i32;
+    stretched.max(MAP_PIXEL_PX)
+}
+/// 4×4 Bayer matrix. A cell uses the high color when its mix clears this threshold.
+const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+/// Match outline is a solid edge. Hover fills an even quarter of the cells.
+struct DitherGlows {
+    outline: Option<Color32>,
+    hover: bool,
+}
+
 /// Each box shades from its own color at the top edge to 30% darker at the
-/// bottom edge. The fade belongs to that rectangle, so neighboring boxes
-/// do not share one gradient.
-fn paint_tile_gradient(painter: &egui::Painter, rect: Rect, color: Color32) {
+/// bottom edge. The fade is a pixel-aligned Bayer stipple, so neighboring
+/// boxes do not share one smooth gradient. A match outline is a solid line
+/// on that grid, and a hover fills an even quarter of the cells with the
+/// same green.
+fn paint_tile_gradient(
+    painter: &egui::Painter,
+    grid: &MapGrid,
+    rect: Rect,
+    color: Color32,
+    glows: &DitherGlows,
+) {
+    paint_dither(painter, grid, rect, Some(color), glows);
+}
+
+/// Stippled glow on top of a folder frame or an excluded hatch, which have no
+/// shade fill of their own.
+fn paint_dither_overlay(painter: &egui::Painter, grid: &MapGrid, rect: Rect, glows: &DitherGlows) {
+    paint_dither(painter, grid, rect, None, glows);
+}
+
+fn paint_dither(
+    painter: &egui::Painter,
+    grid: &MapGrid,
+    rect: Rect,
+    fill: Option<Color32>,
+    glows: &DitherGlows,
+) {
+    if let Some(mesh) = dither_mesh(rect, grid, fill, glows) {
+        painter.add(mesh);
+    }
+}
+
+fn dither_mesh(
+    rect: Rect,
+    grid: &MapGrid,
+    fill: Option<Color32>,
+    glows: &DitherGlows,
+) -> Option<Mesh> {
+    if !rect.is_positive() {
+        return None;
+    }
+    let ppp = grid.pixels_per_point.max(1.0);
+    let cell = grid.cell_px.max(1);
+    let left = (rect.left() * ppp).round() as i32;
+    let top = (rect.top() * ppp).round() as i32;
+    let right = (rect.right() * ppp).round() as i32;
+    let bottom = (rect.bottom() * ppp).round() as i32;
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let width = (right - left) as f32;
+    let height = (bottom - top) as f32;
+    let mut mesh = Mesh::default();
+    let mut x = left - (left - grid.origin_x).rem_euclid(cell);
+    while x < right {
+        let x1 = x + cell;
+        let vis_x0 = x.max(left);
+        let vis_x1 = x1.min(right);
+        let gx = (x - grid.origin_x).div_euclid(cell);
+        let mut y = top - (top - grid.origin_y).rem_euclid(cell);
+        while y < bottom {
+            let y1 = y + cell;
+            let vis_y0 = y.max(top);
+            let vis_y1 = y1.min(bottom);
+            let gy = (y - grid.origin_y).div_euclid(cell);
+            let bayer = BAYER4[gy.rem_euclid(4) as usize][gx.rem_euclid(4) as usize];
+            let t = if height <= 1.0 {
+                0.0
+            } else {
+                ((vis_y0 + vis_y1) as f32 * 0.5 - top as f32) / height
+            };
+            let lx0 = (vis_x0 - left) as f32;
+            let ly0 = (vis_y0 - top) as f32;
+            let lx1 = (vis_x1 - left) as f32;
+            let ly1 = (vis_y1 - top) as f32;
+            let mut color = fill.map(|top_color| {
+                lerp_color(
+                    top_color,
+                    shade_darker(top_color, TILE_SHADE),
+                    dither_mix(t, bayer, DITHER_LEVELS),
+                )
+            });
+            if glows.hover && dither_lit(HOVER_DITHER, bayer) {
+                color = Some(MATCH_GREEN);
+            }
+            if let Some(outline) = glows.outline {
+                if on_outline(lx0, ly0, lx1, ly1, width, height) {
+                    color = Some(outline);
+                }
+            }
+            if let Some(color) = color {
+                push_solid_quad(
+                    &mut mesh,
+                    Rect::from_min_max(
+                        Pos2::new(vis_x0 as f32 / ppp, vis_y0 as f32 / ppp),
+                        Pos2::new(vis_x1 as f32 / ppp, vis_y1 as f32 / ppp),
+                    ),
+                    color,
+                );
+            }
+            y = y1;
+        }
+        x = x1;
+    }
+    if mesh.is_empty() {
+        None
+    } else {
+        Some(mesh)
+    }
+}
+
+/// Where `t` sits between `levels` bands. Bayer values of 0 take the lighter
+/// band first; 15 stays on the darker band until the mix is almost complete.
+fn dither_mix(t: f32, bayer: u8, levels: u8) -> f32 {
+    let bands = u8::max(levels, 2) as f32;
+    let scaled = t.clamp(0.0, 1.0) * (bands - 1.0);
+    let lower = scaled.floor();
+    let frac = scaled - lower;
+    let step = if frac * 16.0 > f32::from(bayer) {
+        lower + 1.0
+    } else {
+        lower
+    };
+    (step / (bands - 1.0)).clamp(0.0, 1.0)
+}
+
+/// True when this cell touches the tile edge, so the outline is one solid
+/// rendered pixel and does not stipple inward.
+fn on_outline(x0: f32, y0: f32, x1: f32, y1: f32, width: f32, height: f32) -> bool {
+    x0 <= 0.0 || y0 <= 0.0 || x1 >= width || y1 >= height
+}
+
+fn dither_lit(coverage: f32, bayer: u8) -> bool {
+    coverage > 0.0 && coverage * 16.0 > f32::from(bayer)
+}
+
+fn lerp_color(from: Color32, to: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |start: u8, end: u8| (start as f32 + (end as f32 - start as f32) * t).round() as u8;
+    let [r1, g1, b1, a1] = from.to_array();
+    let [r2, g2, b2, a2] = to.to_array();
+    Color32::from_rgba_unmultiplied(mix(r1, r2), mix(g1, g2), mix(b1, b2), mix(a1, a2))
+}
+
+fn push_solid_quad(mesh: &mut Mesh, rect: Rect, color: Color32) {
     if !rect.is_positive() {
         return;
     }
-    painter.add(Shape::gradient_rect(
-        rect,
-        Direction::TopDown,
-        [color, shade_darker(color, TILE_SHADE)],
-    ));
+    let index = mesh.vertices.len() as u32;
+    mesh.colored_vertex(rect.left_top(), color);
+    mesh.colored_vertex(rect.right_top(), color);
+    mesh.colored_vertex(rect.right_bottom(), color);
+    mesh.colored_vertex(rect.left_bottom(), color);
+    mesh.add_triangle(index, index + 1, index + 2);
+    mesh.add_triangle(index, index + 2, index + 3);
 }
 
 /// Keep hue and alpha. Multiply the color channels so the result is darker.
@@ -871,88 +1070,6 @@ fn directory_grey(dark: bool, depth: usize) -> Color32 {
         188
     };
     Color32::from_gray(tone)
-}
-
-/// Green (or amber) rim: solid at the outer edge, gone `depth` pixels inward.
-/// Every vertex stays on or inside `rect`.
-fn inset_glow_mesh(rect: Rect, color: Color32, depth: f32) -> Option<Mesh> {
-    if !rect.is_positive() || depth <= 0.0 {
-        return None;
-    }
-    let depth = depth.min(rect.width() * 0.5).min(rect.height() * 0.5);
-    let inner = rect.shrink(depth);
-    if !inner.is_positive() {
-        return None;
-    }
-    let outer = [
-        rect.left_top(),
-        rect.right_top(),
-        rect.right_bottom(),
-        rect.left_bottom(),
-    ];
-    let inner_pts = [
-        inner.left_top(),
-        inner.right_top(),
-        inner.right_bottom(),
-        inner.left_bottom(),
-    ];
-    let mut mesh = Mesh::default();
-    for pos in outer {
-        mesh.colored_vertex(pos, color);
-    }
-    for pos in inner_pts {
-        mesh.colored_vertex(pos, Color32::TRANSPARENT);
-    }
-    for k in 0..4 {
-        let o0 = k as u32;
-        let o1 = ((k + 1) % 4) as u32;
-        let i0 = 4 + k as u32;
-        let i1 = 4 + ((k + 1) % 4) as u32;
-        mesh.add_triangle(o0, o1, i1);
-        mesh.add_triangle(o0, i1, i0);
-    }
-    Some(mesh)
-}
-
-/// Soft glow peaked at the center and gone at the box edge.
-fn radial_glow_mesh(rect: Rect, color: Color32) -> Option<Mesh> {
-    if !rect.is_positive() {
-        return None;
-    }
-    let mut mesh = Mesh::default();
-    mesh.colored_vertex(rect.center(), color);
-    let steps = 4;
-    let rim = perimeter(rect, steps);
-    for pos in &rim {
-        mesh.colored_vertex(*pos, Color32::TRANSPARENT);
-    }
-    let count = rim.len() as u32;
-    for i in 0..count {
-        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % count);
-    }
-    Some(mesh)
-}
-
-fn perimeter(rect: Rect, steps_per_side: usize) -> Vec<Pos2> {
-    let mut pts = Vec::with_capacity(steps_per_side * 4);
-    let t_at = |i: usize| i as f32 / steps_per_side as f32;
-    for i in 0..steps_per_side {
-        let t = t_at(i);
-        pts.push(Pos2::new(rect.left() + rect.width() * t, rect.top()));
-    }
-    for i in 0..steps_per_side {
-        let t = t_at(i);
-        pts.push(Pos2::new(rect.right(), rect.top() + rect.height() * t));
-    }
-    for i in 0..steps_per_side {
-        let t = t_at(i);
-        pts.push(Pos2::new(rect.right() - rect.width() * t, rect.bottom()));
-    }
-    for i in 0..steps_per_side {
-        let t = t_at(i);
-        pts.push(Pos2::new(rect.left(), rect.bottom() - rect.height() * t));
-    }
-    pts
 }
 
 pub fn hatch_rect(painter: &egui::Painter, rect: Rect, color: Color32) {
@@ -1272,6 +1389,52 @@ mod tests {
     }
 
     #[test]
+    fn dither_holds_the_top_color_and_stipples_toward_the_bottom() {
+        assert_eq!(dither_mix(0.0, 0, DITHER_LEVELS), 0.0);
+        assert_eq!(dither_mix(1.0, 15, DITHER_LEVELS), 1.0);
+        let early = dither_mix(0.5, 0, 2);
+        let late = dither_mix(0.5, 15, 2);
+        assert!(
+            early > late,
+            "a low Bayer threshold takes the darker band first"
+        );
+        assert_eq!(map_cell_px(400.0), MAP_PIXEL_PX);
+        assert_eq!(map_cell_px(1_600.0), MAP_PIXEL_PX);
+        assert_eq!(map_cell_px(8_000.0), 10);
+    }
+
+    #[test]
+    fn every_box_uses_the_same_pixel() {
+        let map = Rect::from_min_max(Pos2::ZERO, Pos2::new(400.0, 300.0));
+        let grid = map_grid(map, 2.0);
+        assert_eq!(grid.cell_px, MAP_PIXEL_PX);
+        let fill = Color32::from_rgb(200, 80, 40);
+        let big = dither_mesh(
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(40.0, 30.0)),
+            &grid,
+            Some(fill),
+            &NO_GLOW,
+        )
+        .unwrap();
+        let small = dither_mesh(
+            Rect::from_min_max(Pos2::new(10.0, 4.0), Pos2::new(22.0, 16.0)),
+            &grid,
+            Some(fill),
+            &NO_GLOW,
+        )
+        .unwrap();
+        let pitch = MAP_PIXEL_PX as f32 / grid.pixels_per_point;
+        assert_eq!(widest_cell(&big), pitch);
+        assert_eq!(widest_cell(&small), pitch);
+        for edge in full_cell_edges(&big, grid.pixels_per_point)
+            .into_iter()
+            .chain(full_cell_edges(&small, grid.pixels_per_point))
+        {
+            assert_eq!(edge.rem_euclid(MAP_PIXEL_PX), 0);
+        }
+    }
+
+    #[test]
     fn tile_bottom_is_thirty_percent_darker() {
         let color = Color32::from_rgba_unmultiplied(200, 80, 40, 255);
         let bottom = shade_darker(color, TILE_SHADE);
@@ -1282,27 +1445,81 @@ mod tests {
     #[test]
     fn glows_stay_inside_the_tile_rect() {
         let rect = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(50.0, 80.0));
-        let edge = inset_glow_mesh(rect, Color32::from_rgb(90, 220, 130), MATCH_GLOW_PX).unwrap();
-        let bounds = edge.calc_bounds();
-        assert_eq!(bounds.min, rect.min);
-        assert_eq!(bounds.max, rect.max);
-        let inner = rect.shrink(MATCH_GLOW_PX);
-        let inner_corners = [
-            inner.left_top(),
-            inner.right_top(),
-            inner.right_bottom(),
-            inner.left_bottom(),
-        ];
-        for (vertex, corner) in edge.vertices.iter().skip(4).zip(inner_corners) {
-            assert_eq!(vertex.pos, corner);
-        }
+        let mesh = dither_mesh(
+            rect,
+            &aligned_grid(rect, 2.0, MAP_PIXEL_PX),
+            Some(Color32::from_rgb(20, 40, 60)),
+            &DitherGlows {
+                outline: Some(Color32::from_rgb(90, 220, 130)),
+                hover: true,
+            },
+        )
+        .unwrap();
+        let bounds = mesh.calc_bounds();
+        assert!(bounds.min.x >= rect.left() - 0.51);
+        assert!(bounds.min.y >= rect.top() - 0.51);
+        assert!(bounds.max.x <= rect.right() + 0.51);
+        assert!(bounds.max.y <= rect.bottom() + 0.51);
+    }
 
-        let hover = radial_glow_mesh(rect, HOVER_GLOW).unwrap();
-        let hover_bounds = hover.calc_bounds();
-        assert!(hover_bounds.min.x >= rect.left() - 0.01);
-        assert!(hover_bounds.min.y >= rect.top() - 0.01);
-        assert!(hover_bounds.max.x <= rect.right() + 0.01);
-        assert!(hover_bounds.max.y <= rect.bottom() + 0.01);
+    #[test]
+    fn outline_and_hover_recolor_bayer_cells() {
+        assert!(on_outline(0.0, 0.0, 2.0, 2.0, 40.0, 40.0));
+        assert!(!on_outline(2.0, 2.0, 4.0, 4.0, 40.0, 40.0));
+        assert!(dither_lit(HOVER_DITHER, 0));
+        assert!(dither_lit(HOVER_DITHER, 3));
+        assert!(!dither_lit(HOVER_DITHER, 4));
+        assert!(!dither_lit(0.0, 0));
+
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(40.0, 40.0));
+        let fill = Color32::from_rgb(200, 80, 40);
+        let grid = aligned_grid(rect, 1.0, 2);
+        let plain = dither_mesh(rect, &grid, Some(fill), &NO_GLOW).unwrap();
+        let outlined = dither_mesh(
+            rect,
+            &grid,
+            Some(fill),
+            &DitherGlows {
+                outline: Some(Color32::from_rgb(90, 220, 130)),
+                hover: false,
+            },
+        )
+        .unwrap();
+        let hovered = dither_mesh(
+            rect,
+            &grid,
+            Some(fill),
+            &DitherGlows {
+                outline: None,
+                hover: true,
+            },
+        )
+        .unwrap();
+        let match_green = MATCH_GREEN;
+        assert_eq!(color_at(&outlined, 0.0, 0.0), match_green);
+        assert_eq!(color_at(&outlined, 2.0, 0.0), match_green);
+        assert_ne!(color_at(&plain, 0.0, 0.0), match_green);
+        assert_eq!(color_at(&outlined, 6.0, 16.0), color_at(&plain, 6.0, 16.0));
+        assert_eq!(color_at(&outlined, 2.0, 2.0), color_at(&plain, 2.0, 2.0));
+        assert_eq!(color_at(&hovered, 20.0, 20.0), match_green);
+        assert_ne!(color_at(&hovered, 6.0, 16.0), match_green);
+        let period = Rect::from_min_max(Pos2::ZERO, Pos2::new(8.0, 8.0));
+        let hovered_period = dither_mesh(
+            period,
+            &aligned_grid(period, 1.0, 2),
+            Some(fill),
+            &DitherGlows {
+                outline: None,
+                hover: true,
+            },
+        )
+        .unwrap();
+        let green_quads = hovered_period
+            .vertices
+            .chunks(4)
+            .filter(|quad| quad[0].color == match_green)
+            .count();
+        assert_eq!(green_quads, 4);
     }
 
     #[test]
@@ -1313,7 +1530,40 @@ mod tests {
         let inner = rect.shrink(DIR_PAD);
         assert_eq!(inner.left(), rect.left() + DIR_PAD);
         assert_eq!(inner.top(), rect.top() + DIR_PAD);
-        // The pad is the frame. A glow must not be what produces it.
-        assert_ne!(DIR_PAD, MATCH_GLOW_PX);
+        // The pad is the frame. The tile inset must not be what produces it.
+        assert_ne!(DIR_PAD, TILE_INSET);
+    }
+
+    fn color_at(mesh: &Mesh, x: f32, y: f32) -> Color32 {
+        mesh.vertices
+            .chunks(4)
+            .find(|quad| (quad[0].pos.x - x).abs() < 0.1 && (quad[0].pos.y - y).abs() < 0.1)
+            .unwrap_or_else(|| panic!("no cell at ({x}, {y})"))[0]
+            .color
+    }
+
+    fn aligned_grid(rect: Rect, pixels_per_point: f32, cell_px: i32) -> MapGrid {
+        MapGrid {
+            pixels_per_point,
+            cell_px,
+            origin_x: (rect.left() * pixels_per_point).round() as i32,
+            origin_y: (rect.top() * pixels_per_point).round() as i32,
+        }
+    }
+
+    fn widest_cell(mesh: &Mesh) -> f32 {
+        mesh.vertices
+            .chunks(4)
+            .map(|quad| quad[1].pos.x - quad[0].pos.x)
+            .fold(0.0, f32::max)
+    }
+
+    fn full_cell_edges(mesh: &Mesh, pixels_per_point: f32) -> Vec<i32> {
+        let pitch = MAP_PIXEL_PX as f32 / pixels_per_point;
+        mesh.vertices
+            .chunks(4)
+            .filter(|quad| (quad[1].pos.x - quad[0].pos.x - pitch).abs() < 0.01)
+            .map(|quad| (quad[0].pos.x * pixels_per_point).round() as i32)
+            .collect()
     }
 }

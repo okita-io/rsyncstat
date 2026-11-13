@@ -27,6 +27,9 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_title("RSyncStat"),
+        // Quantized tile colors sit on whole 8-bit values. This keeps the GPU
+        // pass from smoothing the in-between samples of the file-map dither.
+        dithering: true,
         ..Default::default()
     };
     eframe::run_native(
