@@ -19,6 +19,10 @@ A native Rust desktop app that fuses a WinDirStat-style disk treemap with two-wa
 
 > **Status:** early development. Scanning, the treemap and the folder tree work today. One-way copy from folder A to B (never overwriting) works; true two-way sync with a stored snapshot is still to come. See [Roadmap](#roadmap).
 
+<p align="center">
+  <img src="docs/images/rsyncstat-main.png" alt="RSyncStat: source and target folders as treemaps, with include/exclude filters, compare summary and file-type legend" width="900">
+</p>
+
 ## Why
 
 Disk visualizers show where the space goes but never move a byte. Two-way sync tools move bytes but show the result as a list. RSyncStat puts both on one screen so you can see what a sync will do, and how big it is, before you run it. The full design lives in [docs/SPEC.md](docs/SPEC.md).
@@ -38,10 +42,18 @@ Disk visualizers show where the space goes but never move a byte. Two-way sync t
 - Built-in presets: `*.lancedb`, `node_modules/`, `target/`, `.venv/`, system junk files
 - Excluded entries stay visible, drawn with a hatch pattern, so you can see what is skipped
 
-**Two panes and compare**
-- Side-by-side source A / B panes, each with its own folder controls and rescan
-- Pane compare and sync planning in the app (in progress)
-- Trash instead of delete, via the `trash` crate
+**Two panes, compare and sync**
+- Source and target panes side by side, each with its own folder picker, rescan and "show excluded" toggle
+- Compare summary: files that are the same, different in size, or only on one side, plus total space and the size gap
+- One-way copy from source to target with a plan preview, progress, and stop
+- Never overwrites: an existing file is hashed, skipped if identical, and listed (not replaced) if different
+- Safe writes: temp file then rename, retries on transient errors, refuses unsafe paths and symlinked target folders
+- Free-space tiles show how much room is left on each volume
+- Reveal in file manager, and move to Trash after confirmation
+
+**Include and exclude patterns**
+- Separate "files to include" and "files to exclude" fields with match-case, whole-word and regex toggles
+- Built-in preset list you can switch on or off; "Apply & rescan" re-walks both folders
 
 **Keyboard first**
 - Tab follows the visual layout, with high-contrast focus rings
