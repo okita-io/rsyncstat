@@ -36,8 +36,8 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
-      - name: Unit tests (filter, treemap, path elision, keyboard)
-        run: cargo test -p rsyncstat-filter -p rsyncstat-treemap -p rsyncstat-model -p rsyncstat-app keyboard
+      - name: Unit and end-to-end tests
+        run: cargo test --workspace --locked
 
       - name: Build workspace
         run: cargo build --workspace --locked
