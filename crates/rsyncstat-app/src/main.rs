@@ -76,6 +76,9 @@ struct PaneState {
     legend: HashMap<&'static str, u64>,
     /// Relative path → size for files that are in scope. Used to highlight matches.
     file_sizes: Arc<HashMap<String, u64>>,
+    /// When set, excluded files are drawn on this pane's map. Off, their space
+    /// goes back to the files that remain.
+    show_excluded: bool,
     /// Set when `root` is the mount point of a whole drive.
     volume: Option<volume::VolumeSpace>,
     /// Hover text for a free-space or drive-gap tile. Not a path in the tree.
@@ -107,6 +110,7 @@ impl PaneState {
             recent_dirs: VecDeque::new(),
             legend: HashMap::new(),
             file_sizes: Arc::new(HashMap::new()),
+            show_excluded: false,
             volume: None,
             space_hover: None,
             stats: ScanStats {
@@ -305,8 +309,12 @@ struct RsyncStatApp {
     split_fraction: f32,
     active_pane: ActivePane,
     sync_method: SyncMethod,
-    exclude_types: String,
-    exclude_dirs: String,
+    /// Comma-separated globs. Empty keeps every file that is not excluded.
+    files_include: String,
+    /// Comma-separated globs. These replace the old type and directory exclude fields.
+    files_exclude: String,
+    /// Built-in excludes such as `.DS_Store`, `node_modules`, and `target`.
+    use_preset_excludes: bool,
     compare: Option<CompareSummary>,
     compare_dirty: bool,
     preview: Option<SyncPlan>,
@@ -323,6 +331,8 @@ struct RsyncStatApp {
     sync_status: String,
     /// Tail of the recovery log for the current sync (also written to disk).
     recovery_lines: Vec<String>,
+    /// Destination files whose hash differed. They were not overwritten.
+    mismatched_files: Vec<sync::Mismatch>,
     /// Folder dialog started from a click. The panel itself runs after this
     /// event returns; see `pick_folder`.
     folder_pick: Option<(ActivePane, Receiver<Option<PathBuf>>)>,
@@ -339,8 +349,9 @@ impl RsyncStatApp {
             split_fraction: 0.5,
             active_pane: ActivePane::Source,
             sync_method: SyncMethod::AtoB,
-            exclude_types: String::new(),
-            exclude_dirs: String::new(),
+            files_include: String::new(),
+            files_exclude: String::new(),
+            use_preset_excludes: true,
             compare: None,
             compare_dirty: false,
             preview: None,
@@ -353,6 +364,7 @@ impl RsyncStatApp {
             dest_refresh_at: None,
             sync_status: "Sync copies files. It does not delete extras.".to_string(),
             recovery_lines: Vec::new(),
+            mismatched_files: Vec::new(),
             folder_pick: None,
             kbd: keyboard::KeyboardState::default(),
         }
@@ -769,25 +781,19 @@ impl RsyncStatApp {
         scan_root_async(path, Arc::clone(&self.filter), tx, cancel, same_file_system);
     }
 
-    fn partner_highlight_rel(&self, pane: ActivePane) -> Option<Vec<String>> {
-        let other = match pane {
-            ActivePane::Source => ActivePane::Target,
-            ActivePane::Target => ActivePane::Source,
-        };
-        let other_state = self.pane(other);
-        other_state
-            .hover_path
-            .as_ref()
-            .or(other_state.selected_path.as_ref())
-            .map(|p| ui::rel_within_root(p))
+    /// Match glow for `pane`, from the other pane's hover on the previous frame.
+    /// Selection does not keep the glow after the pointer leaves.
+    fn partner_highlight_rel(other_hover: &Option<Vec<String>>) -> Option<Vec<String>> {
+        other_hover.as_ref().map(|path| ui::rel_within_root(path))
     }
 
     fn rules_key(&self) -> String {
         format!(
-            "{}|{}|{}",
+            "{}|{}|{}|{}",
             self.sync_method.label(),
-            self.exclude_types,
-            self.exclude_dirs
+            self.files_include,
+            self.files_exclude,
+            self.use_preset_excludes
         )
     }
 
@@ -811,7 +817,11 @@ impl RsyncStatApp {
                 a,
                 b,
                 self.sync_method,
-                &sync::rules_from_text(&self.exclude_types, &self.exclude_dirs),
+                &sync::rules_from_patterns(
+                    &self.files_include,
+                    &self.files_exclude,
+                    self.use_preset_excludes,
+                ),
             ),
             _ => SyncPlan::default(),
         }
@@ -821,16 +831,21 @@ impl RsyncStatApp {
         if self.syncing {
             return;
         }
-        let lines = sync::filter_lines(&self.exclude_types, &self.exclude_dirs);
+        let lines = sync::filter_lines(
+            &self.files_include,
+            &self.files_exclude,
+            self.use_preset_excludes,
+        );
         let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-        self.filter = Arc::new(FilterSet::from_lines(&borrowed, RuleLevel::Profile));
+        self.filter = Arc::new(FilterSet::from_user_lines(&borrowed, RuleLevel::Profile));
         if let Some(path) = self.source.root.clone() {
             self.start_scan(ActivePane::Source, path);
         }
         if let Some(path) = self.target.root.clone() {
             self.start_scan(ActivePane::Target, path);
         }
-        self.sync_status = "Excludes applied. Open folders are scanning again.".to_string();
+        self.sync_status =
+            "Include and exclude patterns applied. Open folders are scanning again.".to_string();
     }
 
     fn start_sync(&mut self) {
@@ -863,6 +878,7 @@ impl RsyncStatApp {
         self.syncing_method = self.sync_method;
         self.dest_refresh_at = Some(Instant::now() + DEST_REFRESH_EVERY);
         self.recovery_lines.clear();
+        self.mismatched_files.clear();
         let (tx, rx) = unbounded();
         self.sync_rx = Some(rx);
         self.sync_status = format!(
@@ -926,15 +942,29 @@ impl RsyncStatApp {
                     } else {
                         ""
                     };
+                    let skipped = if report.skipped > 0 {
+                        format!(" Skipped {} with the same hash.", report.skipped)
+                    } else {
+                        String::new()
+                    };
+                    let mismatched = if report.mismatched.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " {} differed and were not overwritten.",
+                            report.mismatched.len()
+                        )
+                    };
+                    self.mismatched_files = report.mismatched.clone();
                     self.sync_status = if stopped {
                         format!(
-                            "Sync stopped — {} files, {}.{rescan} Run sync to copy what is left.",
+                            "Sync stopped — {} files, {}.{skipped}{mismatched}{rescan} Run sync to copy what is left.",
                             report.copied,
                             format_bytes(report.bytes),
                         )
                     } else {
                         format!(
-                            "Sync finished — {} files, {}.{recovered}{failed}{rescan}",
+                            "Sync finished — {} files, {}.{recovered}{skipped}{mismatched}{failed}{rescan}",
                             report.copied,
                             format_bytes(report.bytes),
                         )
@@ -1164,58 +1194,6 @@ impl eframe::App for RsyncStatApp {
                     )
                     .inner;
                 self.paint_focus_if(ui, combo_resp.rect, keyboard::FocusId::SyncMethod);
-                ui.label(keyboard::raw_label_for(keyboard::FocusId::ExcludeTypes));
-                let types = ui
-                    .push_id(
-                        keyboard::focus_egui_id(keyboard::FocusId::ExcludeTypes),
-                        |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.exclude_types)
-                                    .hint_text("log, tmp, jpg")
-                                    .desired_width(150.0),
-                            )
-                        },
-                    )
-                    .inner;
-                self.paint_focus_if(ui, types.rect, keyboard::FocusId::ExcludeTypes);
-                ui.label(keyboard::raw_label_for(keyboard::FocusId::ExcludeDirs));
-                let dirs = ui
-                    .push_id(
-                        keyboard::focus_egui_id(keyboard::FocusId::ExcludeDirs),
-                        |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.exclude_dirs)
-                                    .hint_text("node_modules, .git, target")
-                                    .desired_width(190.0),
-                            )
-                        },
-                    )
-                    .inner;
-                self.paint_focus_if(ui, dirs.rect, keyboard::FocusId::ExcludeDirs);
-                let r = ui
-                    .push_id(
-                        keyboard::focus_egui_id(keyboard::FocusId::ApplyRescan),
-                        |ui| {
-                            ui.add_enabled(
-                                !self.syncing,
-                                egui::Button::new(keyboard::layout_job_for_label(
-                                    ui,
-                                    &keyboard::parse_access_label(keyboard::raw_label_for(
-                                        keyboard::FocusId::ApplyRescan,
-                                    )),
-                                    show_mnemonic,
-                                    egui::TextStyle::Button,
-                                )),
-                            )
-                        },
-                    )
-                    .inner;
-                self.paint_focus_if(ui, r.rect, keyboard::FocusId::ApplyRescan);
-                if r.clicked() {
-                    self.apply_excludes();
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
                 let r = if self.syncing {
                     ui.push_id(keyboard::focus_egui_id(keyboard::FocusId::RunSync), |ui| {
                         ui.add_enabled(
@@ -1279,6 +1257,33 @@ impl eframe::App for RsyncStatApp {
                     plan.excluded,
                 ));
             }
+            if !self.mismatched_files.is_empty() {
+                let title = match sync::mismatch_list_path() {
+                    Some(path) => format!(
+                        "Mismatched files not overwritten ({}) — {}",
+                        self.mismatched_files.len(),
+                        path.display()
+                    ),
+                    None => format!(
+                        "Mismatched files not overwritten ({})",
+                        self.mismatched_files.len()
+                    ),
+                };
+                egui::CollapsingHeader::new(title)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label(
+                            "These already existed with a different hash. The destination was left as it was.",
+                        );
+                        egui::ScrollArea::vertical()
+                            .max_height(140.0)
+                            .show(ui, |ui| {
+                                for item in &self.mismatched_files {
+                                    ui.label(format!("{} {}", item.direction, item.rel));
+                                }
+                            });
+                    });
+            }
             if !self.recovery_lines.is_empty() {
                 let log_path = rsyncstat_scan::recovery_log_path();
                 let title = match &log_path {
@@ -1327,6 +1332,14 @@ impl eframe::App for RsyncStatApp {
             }
         });
 
+        // The status line above already read last frame's hover. Drop it now so
+        // a pointer that has left the map does not keep the last box glowing.
+        // This frame's tree and map write a fresh hover while they are painted.
+        let source_hover = self.source.hover_path.clone();
+        let target_hover = self.target.hover_path.clone();
+        self.source.hover_path = None;
+        self.target.hover_path = None;
+
         let active = self.active_pane;
         let tree = self.pane(active).tree.clone();
         let active_scanning = self.pane(active).scanning;
@@ -1335,14 +1348,10 @@ impl eframe::App for RsyncStatApp {
         let active_stats_files = self.pane(active).stats.files;
         let active_started = self.pane(active).started;
         let active_legend = self.pane(active).legend.clone();
-        let partner_rel = self
-            .pane(match active {
-                ActivePane::Source => ActivePane::Target,
-                ActivePane::Target => ActivePane::Source,
-            })
-            .hover_path
-            .as_ref()
-            .map(|p| ui::rel_within_root(p));
+        let partner_rel = Self::partner_highlight_rel(match active {
+            ActivePane::Source => &target_hover,
+            ActivePane::Target => &source_hover,
+        });
         let other_files = match active {
             ActivePane::Source => Arc::clone(&self.target.file_sizes),
             ActivePane::Target => Arc::clone(&self.source.file_sizes),
@@ -1399,12 +1408,67 @@ impl eframe::App for RsyncStatApp {
                     );
                     ui.separator();
                 }
-                ui.heading(
-                    keyboard::parse_access_label(keyboard::raw_label_for(
-                        keyboard::FocusId::DirectoryTree,
-                    ))
-                    .display,
+                ui.add_space(2.0);
+                let include = ui::pattern_edit(
+                    ui,
+                    "files-include",
+                    "files to include",
+                    "*.rs, src/**",
+                    &mut self.files_include,
+                    ui::PatternIcon::Book,
+                    "Comma-separated patterns. Empty includes every file that is not excluded. Example: *.rs, src/**",
                 );
+                self.paint_focus_if(ui, include.rect, keyboard::FocusId::ExcludeTypes);
+                ui.add_space(8.0);
+                let gear_tip = if self.use_preset_excludes {
+                    "Built-in excludes are on (.DS_Store, node_modules, target, …). Click to turn them off."
+                } else {
+                    "Built-in excludes are off. Click to turn them on."
+                };
+                let exclude = ui::pattern_edit(
+                    ui,
+                    "files-exclude",
+                    "files to exclude",
+                    "*.log, node_modules",
+                    &mut self.files_exclude,
+                    ui::PatternIcon::Gear {
+                        slashed: !self.use_preset_excludes,
+                    },
+                    gear_tip,
+                );
+                self.paint_focus_if(ui, exclude.rect, keyboard::FocusId::ExcludeDirs);
+                ui.add_space(6.0);
+                let apply = ui
+                    .push_id(
+                        keyboard::focus_egui_id(keyboard::FocusId::ApplyRescan),
+                        |ui| {
+                            ui.add_enabled(
+                                !self.syncing,
+                                egui::Button::new(keyboard::layout_job_for_label(
+                                    ui,
+                                    &keyboard::parse_access_label(keyboard::raw_label_for(
+                                        keyboard::FocusId::ApplyRescan,
+                                    )),
+                                    show_mnemonic,
+                                    egui::TextStyle::Button,
+                                )),
+                            )
+                        },
+                    )
+                    .inner;
+                self.paint_focus_if(ui, apply.rect, keyboard::FocusId::ApplyRescan);
+                if !self.syncing {
+                    if exclude.icon_clicked {
+                        self.use_preset_excludes = !self.use_preset_excludes;
+                    }
+                    if apply.clicked()
+                        || include.submitted
+                        || exclude.submitted
+                        || exclude.icon_clicked
+                    {
+                        self.apply_excludes();
+                    }
+                }
                 ui.separator();
                 if let Some(ref t) = tree {
                     let root_path = vec![t.name.clone()];
@@ -1482,6 +1546,7 @@ impl eframe::App for RsyncStatApp {
                     ui.available_size(),
                     ui.scope_id().with("solo"),
                     show_mnemonic,
+                    &target_hover,
                 );
                 return;
             }
@@ -1503,6 +1568,7 @@ impl eframe::App for RsyncStatApp {
                             Vec2::new(left_w, height),
                             ui.scope_id().with("pane_a"),
                             show_mnemonic,
+                            &target_hover,
                         );
                     },
                 );
@@ -1548,6 +1614,7 @@ impl eframe::App for RsyncStatApp {
                             Vec2::new(right_w, height),
                             ui.scope_id().with("pane_b"),
                             show_mnemonic,
+                            &source_hover,
                         );
                     },
                 );
@@ -1568,6 +1635,7 @@ impl RsyncStatApp {
         size: Vec2,
         pane_id: egui::Id,
         show_mnemonic: bool,
+        other_hover: &Option<Vec<String>>,
     ) {
         let title = match pane {
             ActivePane::Source => "Source (A)",
@@ -1625,11 +1693,13 @@ impl RsyncStatApp {
             } else if self.pane(pane).refreshing {
                 ui.weak("refreshing");
             }
+            ui.checkbox(&mut self.pane_mut(pane).show_excluded, "Show excluded")
+                .on_hover_text("Striped tiles for files the filter skipped.");
         });
         ui.separator();
 
         let tree = self.pane(pane).tree.clone();
-        let partner_rel = self.partner_highlight_rel(pane);
+        let partner_rel = Self::partner_highlight_rel(other_hover);
         let other_files = match pane {
             ActivePane::Source => Arc::clone(&self.target.file_sizes),
             ActivePane::Target => Arc::clone(&self.source.file_sizes),
@@ -1639,6 +1709,7 @@ impl RsyncStatApp {
             ActivePane::Target => self.source.tree.is_some(),
         };
         let space_tiles = self.pane_space_tiles(pane);
+        let show_excluded = self.pane(pane).show_excluded;
 
         if let Some(ref t) = tree {
             let (selected, hover, space_hover) = match pane {
@@ -1687,6 +1758,7 @@ impl RsyncStatApp {
                     scanning,
                     other_ready.then_some(other_files.as_ref()),
                     &space_tiles,
+                    show_excluded,
                 );
             }
         } else if scanning {
@@ -1827,10 +1899,10 @@ fn run_after_event(work: impl FnOnce() + Send + 'static) {
         let work: Box<dyn FnOnce() + Send> = Box::new(work);
         let ctx = Box::into_raw(Box::new(work));
         // SAFETY: `ctx` is a Box we own. The main queue calls `call_after_event`
-        // exactly once, and that function frees it. The queue pointer from
-        // `dispatch_get_main_queue` is the process-wide main queue.
+        // exactly once, and that function frees it. The queue pointer is the
+        // process-wide main queue (`_dispatch_main_q`).
         unsafe {
-            dispatch_async_f(dispatch_get_main_queue(), ctx.cast(), call_after_event);
+            dispatch_async_f(main_queue(), ctx.cast(), call_after_event);
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -1847,8 +1919,15 @@ extern "C" fn call_after_event(ctx: *mut std::ffi::c_void) {
 }
 
 #[cfg(target_os = "macos")]
+fn main_queue() -> *mut std::ffi::c_void {
+    // Recent SDKs define `dispatch_get_main_queue()` as an inline that returns
+    // `&_dispatch_main_q`, so that function is not a linkable symbol.
+    std::ptr::addr_of!(_dispatch_main_q).cast_mut().cast()
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn dispatch_get_main_queue() -> *mut std::ffi::c_void;
+    static _dispatch_main_q: u8;
     fn dispatch_async_f(
         queue: *mut std::ffi::c_void,
         context: *mut std::ffi::c_void,

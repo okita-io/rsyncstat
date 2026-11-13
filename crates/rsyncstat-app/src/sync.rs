@@ -1,12 +1,14 @@
 //! Compare two scanned trees and copy files between them.
 //!
-//! One-way sync copies missing files and overwrites when the size differs.
-//! It does not delete extras on the destination. Two-way sync copies only
-//! files that are missing on the other side, and leaves size mismatches alone.
+//! One-way sync copies files that are missing on the destination. When the
+//! destination file already exists, the contents are hashed: a match is skipped,
+//! and a different hash is recorded and left in place. Nothing is overwritten.
+//! Two-way sync copies only files that are missing on the other side.
 
+use rsyncstat_filter::FilterSet;
 use rsyncstat_model::TreeNode;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,13 +47,11 @@ pub enum MatchKind {
     Different,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Include and exclude globs for one sync plan.
+///
+/// An empty include list keeps every file the exclude list does not drop.
 pub struct SyncRules {
-    /// Extensions without a leading dot, matched case-insensitively.
-    /// `tar.gz` matches names that end in `.tar.gz`.
-    pub file_types: Vec<String>,
-    /// Directory names. A match anywhere in the relative path drops that subtree.
-    pub dir_names: Vec<String>,
+    filter: FilterSet,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,15 +99,32 @@ pub struct CopyFailure {
     pub message: String,
 }
 
+/// A destination file whose contents differ. It was not replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mismatch {
+    pub rel: String,
+    pub direction: &'static str,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SyncReport {
     pub copied: u64,
     pub bytes: u64,
     /// Copies that failed once and then succeeded.
     pub recovered: u64,
+    /// Destination already had the same bytes.
+    pub skipped: u64,
+    /// Destination existed with different bytes and was left alone.
+    pub mismatched: Vec<Mismatch>,
     pub errors: Vec<CopyFailure>,
     /// The user stopped the run. Files not started yet were left in place.
     pub stopped: bool,
+}
+
+enum Placed {
+    Copied { bytes: u64, recovered: bool },
+    Skipped,
+    Mismatch,
 }
 
 #[derive(Debug)]
@@ -122,48 +139,94 @@ pub enum SyncEvent {
     Finished(SyncReport),
 }
 
-pub fn parse_file_types(raw: &str) -> Vec<String> {
-    split_tokens(raw)
-        .into_iter()
-        .map(|token| {
-            token
-                .trim_start_matches("*.")
-                .trim_start_matches('.')
-                .to_ascii_lowercase()
-        })
-        .filter(|token| is_safe_token(token))
-        .collect()
-}
-
-pub fn parse_dir_names(raw: &str) -> Vec<String> {
-    split_tokens(raw)
-        .into_iter()
-        .map(|token| token.trim_matches('/').to_string())
-        .filter(|token| is_safe_token(token))
-        .collect()
-}
-
-pub fn rules_from_text(file_types: &str, dir_names: &str) -> SyncRules {
+pub fn rules_from_patterns(include: &str, exclude: &str, use_presets: bool) -> SyncRules {
+    let lines = filter_lines(include, exclude, use_presets);
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
     SyncRules {
-        file_types: parse_file_types(file_types),
-        dir_names: parse_dir_names(dir_names),
+        filter: FilterSet::from_user_lines(&borrowed, rsyncstat_filter::RuleLevel::Profile),
     }
 }
 
-/// Preset lines plus the extra type and directory excludes, ready for [`rsyncstat_filter::FilterSet`].
-pub fn filter_lines(file_types: &str, dir_names: &str) -> Vec<String> {
-    let rules = rules_from_text(file_types, dir_names);
-    let mut lines: Vec<String> = rsyncstat_filter::default_preset_rules()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    for ext in rules.file_types {
-        lines.push(format!("*.{ext}"));
+impl SyncRules {
+    fn excludes(&self, rel: &str, is_dir: bool) -> bool {
+        self.filter.verdict(Path::new(rel), is_dir).excluded
     }
-    for name in rules.dir_names {
-        lines.push(format!("{name}/"));
+}
+
+/// Gitignore lines for the scan and the sync plan.
+///
+/// Patterns are comma-separated. `*.log` and `node_modules` exclude those names.
+/// Include patterns are a whitelist: an empty include list keeps every file
+/// that is not excluded. Excludes are applied after includes, so they win.
+pub fn filter_lines(include: &str, exclude: &str, use_presets: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if use_presets {
+        lines.extend(
+            rsyncstat_filter::default_preset_rules()
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    let includes = split_patterns(include);
+    if !includes.is_empty() {
+        // Drop everything, keep directories walkable, then put the requested
+        // names back. User excludes are appended after this so they still win.
+        lines.push("*".to_string());
+        lines.push("!*/".to_string());
+        for token in includes {
+            lines.extend(include_lines(&token));
+        }
+    }
+    for token in split_patterns(exclude) {
+        if let Some(line) = exclude_line(&token) {
+            lines.push(line);
+        }
     }
     lines
+}
+
+fn split_patterns(raw: &str) -> Vec<&str> {
+    raw.split([',', ';', '\n'])
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn safe_pattern(token: &str) -> bool {
+    let token = token.trim().trim_start_matches('!');
+    !token.is_empty()
+        && !token.contains(['\n', '\r', '\0'])
+        && token.split(['/', '\\']).all(|part| part != "..")
+}
+
+fn exclude_line(token: &str) -> Option<String> {
+    let token = token.trim().trim_start_matches('!');
+    if !safe_pattern(token) {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+fn include_lines(token: &str) -> Vec<String> {
+    let token = token.trim().trim_start_matches('!');
+    if !safe_pattern(token) {
+        return Vec::new();
+    }
+    let token = token.trim_end_matches('/');
+    if token.is_empty() {
+        return Vec::new();
+    }
+    // A slash or a wildcard is used as written, anchored the way gitignore anchors it.
+    // A bare name also matches that file or directory in any folder.
+    if token.contains(['*', '?', '/']) {
+        return vec![format!("!{token}"), format!("!{token}/**")];
+    }
+    vec![
+        format!("!{token}"),
+        format!("!{token}/**"),
+        format!("!**/{token}"),
+        format!("!**/{token}/**"),
+    ]
 }
 
 pub fn match_file(rel: &str, size: u64, other: &HashMap<String, u64>) -> Option<MatchKind> {
@@ -350,13 +413,18 @@ pub fn execute(
         done += 1;
         progress(done, total, &op.rel);
         match copy_with_retry(from_root, to_root, &op.rel, direction, cancel, &mut log) {
-            Ok((bytes, recovered)) => {
+            Ok(Placed::Copied { bytes, recovered }) => {
                 report.copied += 1;
                 report.bytes += bytes;
                 if recovered {
                     report.recovered += 1;
                 }
             }
+            Ok(Placed::Skipped) => report.skipped += 1,
+            Ok(Placed::Mismatch) => report.mismatched.push(Mismatch {
+                rel: op.rel.clone(),
+                direction,
+            }),
             Err(failure) => {
                 // A stop between retries is not a failed copy.
                 if failure.message == "stopped" {
@@ -396,11 +464,16 @@ pub fn execute(
                 cancel,
                 &mut log,
             ) {
-                Ok((bytes, _)) => {
+                Ok(Placed::Copied { bytes, .. }) => {
                     report.copied += 1;
                     report.bytes += bytes;
                     report.recovered += 1;
                 }
+                Ok(Placed::Skipped) => report.skipped += 1,
+                Ok(Placed::Mismatch) => report.mismatched.push(Mismatch {
+                    rel: failure.rel.clone(),
+                    direction: failure.direction,
+                }),
                 Err(err) => {
                     if err.message == "stopped" {
                         report.stopped = true;
@@ -412,6 +485,9 @@ pub fn execute(
         }
     } else {
         report.errors = failed;
+    }
+    if let Some(path) = persist_mismatches(&report.mismatched) {
+        log(format!("mismatch list {}", path.display()));
     }
     report
 }
@@ -477,7 +553,7 @@ fn copy_with_retry(
     direction: &'static str,
     cancel: &AtomicBool,
     log: &mut impl FnMut(String),
-) -> Result<(u64, bool), CopyFailure> {
+) -> Result<Placed, CopyFailure> {
     let mut attempt = 0u32;
     loop {
         if attempt > 0 && cancel.load(Ordering::Relaxed) {
@@ -489,14 +565,29 @@ fn copy_with_retry(
             });
         }
         attempt += 1;
-        match copy_rel(from_root, to_root, rel) {
-            Ok(bytes) => {
+        match place_file(from_root, to_root, rel) {
+            Ok(Placed::Copied { bytes, .. }) => {
                 if attempt > 1 {
                     log(format!(
                         "recovered {direction} {rel} after {attempt} attempts"
                     ));
                 }
-                return Ok((bytes, attempt > 1));
+                return Ok(Placed::Copied {
+                    bytes,
+                    recovered: attempt > 1,
+                });
+            }
+            Ok(Placed::Skipped) => {
+                log(format!(
+                    "skip {direction} {rel}: hash matches, left in place"
+                ));
+                return Ok(Placed::Skipped);
+            }
+            Ok(Placed::Mismatch) => {
+                log(format!(
+                    "mismatch {direction} {rel}: hash differs, not overwritten"
+                ));
+                return Ok(Placed::Mismatch);
             }
             Err(err) => {
                 log(format!(
@@ -549,12 +640,17 @@ fn retry_wait(attempt: u32, err: &io::Error) -> Option<Duration> {
     }
 }
 
-fn copy_rel(from_root: &Path, to_root: &Path, rel: &str) -> io::Result<u64> {
+/// Copy `rel` when the destination is absent. An existing file is hashed and
+/// either skipped or reported. It is never replaced.
+fn place_file(from_root: &Path, to_root: &Path, rel: &str) -> io::Result<Placed> {
     let rel_path = safe_rel(rel).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "refusing unsafe relative path")
     })?;
     let from = from_root.join(&rel_path);
     let to = to_root.join(&rel_path);
+    if to.is_file() {
+        return classify_existing(&from, &to);
+    }
     let parent = to
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
@@ -565,6 +661,9 @@ fn copy_rel(from_root: &Path, to_root: &Path, rel: &str) -> io::Result<u64> {
         .to_os_string();
     tmp_name.push(COPY_TEMP_SUFFIX);
     let tmp = to.with_file_name(tmp_name);
+    // A leftover temp from an earlier attempt makes macOS clonefile return
+    // "file exists" instead of replacing it.
+    let _ = fs::remove_file(&tmp);
     let bytes = match fs::copy(&from, &tmp) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -572,17 +671,85 @@ fn copy_rel(from_root: &Path, to_root: &Path, rel: &str) -> io::Result<u64> {
             return Err(err);
         }
     };
-    if to.exists() {
-        if let Err(err) = fs::remove_file(&to) {
-            let _ = fs::remove_file(&tmp);
-            return Err(err);
-        }
+    // The destination showed up while the bytes were copying. Keep it and compare.
+    if to.is_file() {
+        let _ = fs::remove_file(&tmp);
+        return classify_existing(&from, &to);
     }
     if let Err(err) = fs::rename(&tmp, &to) {
         let _ = fs::remove_file(&tmp);
         return Err(err);
     }
-    Ok(bytes)
+    Ok(Placed::Copied {
+        bytes,
+        recovered: false,
+    })
+}
+
+fn classify_existing(from: &Path, to: &Path) -> io::Result<Placed> {
+    if same_content(from, to)? {
+        Ok(Placed::Skipped)
+    } else {
+        Ok(Placed::Mismatch)
+    }
+}
+
+/// Equal lengths still get a content hash. Different lengths cannot match.
+fn same_content(from: &Path, to: &Path) -> io::Result<bool> {
+    if fs::metadata(from)?.len() != fs::metadata(to)?.len() {
+        return Ok(false);
+    }
+    Ok(content_hash(from)? == content_hash(to)?)
+}
+
+fn content_hash(path: &Path) -> io::Result<blake3::Hash> {
+    let file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(file)?;
+    Ok(hasher.finalize())
+}
+
+/// Where the last sync wrote files that existed and did not match.
+pub fn mismatch_list_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(
+        PathBuf::from(home)
+            .join(".rsyncstat")
+            .join("mismatched-files.txt"),
+    )
+}
+
+fn persist_mismatches(items: &[Mismatch]) -> Option<PathBuf> {
+    let path = mismatch_list_path()?;
+    if items.is_empty() {
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        return None;
+    }
+    write_mismatch_list(&path, items).ok()?;
+    Some(path)
+}
+
+fn write_mismatch_list(path: &Path, items: &[Mismatch]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut body = String::from(
+        "# Files that already existed with a different hash. They were not overwritten.\n",
+    );
+    for item in items {
+        body.push_str(item.direction);
+        body.push(' ');
+        body.push_str(&item.rel);
+        body.push('\n');
+    }
+    fs::write(path, body)
 }
 
 fn safe_rel(rel: &str) -> Option<PathBuf> {
@@ -620,12 +787,12 @@ fn walk(
             format!("{prefix}/{}", child.name)
         };
         if child.is_dir {
-            if child.excluded || rules.dir_names.iter().any(|name| name == &child.name) {
+            if child.excluded || rules.excludes(&rel, true) {
                 *excluded += count_files(child);
                 continue;
             }
             walk(child, &rel, rules, files, excluded);
-        } else if child.excluded || ext_excluded(&child.name, &rules.file_types) {
+        } else if child.excluded || rules.excludes(&rel, false) {
             *excluded += 1;
         } else {
             files.insert(rel, child.size);
@@ -638,25 +805,6 @@ fn count_files(node: &TreeNode) -> u64 {
         return 1;
     }
     node.children.iter().map(count_files).sum()
-}
-
-fn ext_excluded(name: &str, types: &[String]) -> bool {
-    let lower = name.to_ascii_lowercase();
-    types.iter().any(|ext| lower.ends_with(&format!(".{ext}")))
-}
-
-fn split_tokens(raw: &str) -> Vec<&str> {
-    raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .collect()
-}
-
-fn is_safe_token(token: &str) -> bool {
-    !token.is_empty()
-        && token != "."
-        && token != ".."
-        && !token.contains(['/', '\\', '*', '?', '!', '#', '[', ']'])
 }
 
 #[cfg(test)]
@@ -681,22 +829,31 @@ mod tests {
     }
 
     #[test]
-    fn parses_types_and_directory_names() {
-        assert_eq!(
-            parse_file_types("log, *.bak TMP .jpg"),
-            vec!["log", "bak", "tmp", "jpg"]
-        );
-        assert_eq!(
-            parse_dir_names("node_modules, .git, node_modules/"),
-            vec!["node_modules", ".git", "node_modules"]
-        );
-        assert!(parse_dir_names("skip/nested").is_empty());
+    fn patterns_become_gitignore_lines() {
+        let lines = filter_lines("*.rs, src/**", "*.log, node_modules", false);
+        assert!(lines.iter().any(|line| line == "*.log"));
+        assert!(lines.iter().any(|line| line == "node_modules"));
+        assert!(lines.iter().any(|line| line == "*"));
+        assert!(lines.iter().any(|line| line == "!*/"));
+        assert!(lines.iter().any(|line| line == "!*.rs"));
+        assert!(lines.iter().any(|line| line == "!src/**"));
+        assert!(filter_lines("", "../secret", false).is_empty());
+    }
+
+    #[test]
+    fn include_patterns_keep_only_matching_files() {
+        let (a, b) = sample_trees();
+        let rules = rules_from_patterns("*.txt", "skip", false);
+        let plan = plan_sync(&a, &b, SyncMethod::AtoB, &rules);
+        let mut copied: Vec<_> = plan.a_to_b.iter().map(|op| op.rel.as_str()).collect();
+        copied.sort();
+        assert_eq!(copied, vec!["diff.txt", "only_a.txt"]);
     }
 
     #[test]
     fn one_way_copies_missing_and_different_sizes() {
         let (a, b) = sample_trees();
-        let rules = rules_from_text("log, jpg", "skip");
+        let rules = rules_from_patterns("", "*.log, *.jpg, skip", false);
         let plan = plan_sync(&a, &b, SyncMethod::AtoB, &rules);
         assert_eq!(plan.same, 1);
         assert_eq!(
@@ -713,7 +870,7 @@ mod tests {
     #[test]
     fn two_way_copies_only_missing_files() {
         let (a, b) = sample_trees();
-        let rules = rules_from_text("log jpg", "skip");
+        let rules = rules_from_patterns("", "*.log, *.jpg, skip", false);
         let plan = plan_sync(&a, &b, SyncMethod::BothWays, &rules);
         assert_eq!(plan.different, 1);
         assert_eq!(plan.a_to_b.len(), 1);
@@ -934,5 +1091,78 @@ mod tests {
 
         let refused = io::Error::new(io::ErrorKind::InvalidInput, "no");
         assert_eq!(retry_wait(1, &refused), None);
+    }
+
+    #[test]
+    fn existing_file_with_the_same_hash_is_skipped() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rsyncstat-same-{nanos}"));
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("chapter.json"), b"{\"act\":2}").unwrap();
+        fs::write(b.join("chapter.json"), b"{\"act\":2}").unwrap();
+        let plan = SyncPlan {
+            a_to_b: vec![CopyOp {
+                rel: "chapter.json".into(),
+                bytes: 9,
+            }],
+            ..SyncPlan::default()
+        };
+        let mut lines = Vec::new();
+        let report = execute(
+            &a,
+            &b,
+            &plan,
+            &AtomicBool::new(false),
+            |_, _, _| {},
+            |line| lines.push(line),
+        );
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(report.mismatched.is_empty());
+        assert!(report.errors.is_empty());
+        assert_eq!(fs::read(b.join("chapter.json")).unwrap(), b"{\"act\":2}");
+        assert!(lines.iter().any(|line| line.contains("hash matches")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn existing_file_with_a_different_hash_is_listed_and_kept() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rsyncstat-diff-{nanos}"));
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("chapter.json"), b"source-a").unwrap();
+        fs::write(b.join("chapter.json"), b"source-b").unwrap();
+        let list = root.join("mismatched-files.txt");
+        let plan = SyncPlan {
+            a_to_b: vec![CopyOp {
+                rel: "chapter.json".into(),
+                bytes: 8,
+            }],
+            ..SyncPlan::default()
+        };
+        let report = execute(&a, &b, &plan, &AtomicBool::new(false), |_, _, _| {}, |_| {});
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.mismatched.len(), 1);
+        assert_eq!(report.mismatched[0].rel, "chapter.json");
+        assert_eq!(report.mismatched[0].direction, "A→B");
+        assert_eq!(fs::read(b.join("chapter.json")).unwrap(), b"source-b");
+        write_mismatch_list(&list, &report.mismatched).unwrap();
+        let saved = fs::read_to_string(&list).unwrap();
+        assert!(saved.contains("A→B chapter.json"));
+        assert!(!saved.contains("destination"));
+        let _ = fs::remove_dir_all(&root);
     }
 }

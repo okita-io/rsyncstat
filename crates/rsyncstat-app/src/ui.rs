@@ -2,9 +2,13 @@
 
 use crate::sync::{self, MatchKind};
 use crate::volume::SpaceTile;
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use eframe::egui::{
+    self, Color32, Direction, FontId, Mesh, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2,
+};
 use egui_ltreeview::{Action, NodeBuilder, RowLayout, TreeView, TreeViewState};
-use rsyncstat_model::{elide_path_for_width, file_type_bucket, TreeNode};
+use rsyncstat_model::{
+    elide_path_for_width, file_color_rgb, file_type_bucket, readable_color_rgb, TreeNode,
+};
 use rsyncstat_treemap::squarify_indices;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -23,24 +27,23 @@ pub struct TreemapCtx<'a> {
     pub partner_highlight_rel: Option<Vec<String>>,
 }
 
-const TYPE_COLORS: &[Color32] = &[
-    Color32::from_rgb(80, 120, 200),
-    Color32::from_rgb(90, 170, 110),
-    Color32::from_rgb(200, 130, 70),
-    Color32::from_rgb(170, 90, 170),
-    Color32::from_rgb(200, 190, 80),
-    Color32::from_rgb(120, 180, 200),
-    Color32::from_rgb(200, 100, 100),
-    Color32::from_rgb(140, 140, 140),
-];
-
 const FREE_COLOR: Color32 = Color32::from_rgb(118, 130, 146);
+/// Leaf tiles stay inset by this fixed amount. Glows paint inside it, so a
+/// match or hover never grows or shrinks the box.
+const TILE_INSET: f32 = 1.0;
+/// Nested directory contents keep this pad. It is the grey frame around the
+/// files and does not change when a glow is shown.
+const DIR_PAD: f32 = 2.0;
+/// Match glow reaches this far in from the tile edge, then fades out.
+const MATCH_GLOW_PX: f32 = 3.0;
+/// Bottom edge of each tile is this fraction of the top color, so the box
+/// shades 30% darker toward its own bottom edge.
+const TILE_SHADE: f32 = 0.7;
+/// Hover partner glow, drawn from the center of the box. Quieter than the match rim.
+const HOVER_GLOW: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 88);
 
-fn type_color(bucket: &str) -> Color32 {
-    let h = bucket
-        .bytes()
-        .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
-    TYPE_COLORS[h % TYPE_COLORS.len()]
+fn color_from_rgb(rgb: [u8; 3]) -> Color32 {
+    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
 
 pub fn tree_view_with_path(
@@ -179,7 +182,7 @@ fn paint_tree_row(
     if let Some(color) = label.mark {
         text = text.color(color);
     } else if label.excluded {
-        text = text.color(ui.visuals().weak_text_color());
+        text = text.strikethrough().color(ui.visuals().weak_text_color());
     }
     let response = ui.add(egui::Label::new(text).selectable(false));
     if response.hovered() || pointer_on_row(ui, response.rect) {
@@ -206,13 +209,14 @@ fn pointer_on_row(ui: &egui::Ui, label: Rect) -> bool {
 }
 
 fn tree_row_text(node: &TreeNode) -> String {
-    let size_text = if node.excluded {
-        "(excluded)".to_string()
-    } else {
-        format_size(node.size)
-    };
     let suffix = if node.is_dir { "/" } else { "" };
-    format!("{}{suffix}  {size_text}", node.name)
+    // An excluded directory is not measured, so it has no size to show.
+    // The row is drawn with a strikethrough instead of an "(excluded)" note.
+    if node.excluded && node.is_dir {
+        format!("{}{suffix}", node.name)
+    } else {
+        format!("{}{suffix}  {}", node.name, format_size(node.size))
+    }
 }
 
 pub fn collect_type_sizes(root: &TreeNode) -> HashMap<&'static str, u64> {
@@ -230,7 +234,8 @@ pub fn type_legend(ui: &mut egui::Ui, buckets: &HashMap<&'static str, u64>) {
     for (name, bytes) in items {
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::hover());
-            ui.painter().rect_filled(rect, 2.0, type_color(name));
+            ui.painter()
+                .rect_filled(rect, 0.0, color_from_rgb(readable_color_rgb(name)));
             ui.label(format!("{name}: {}", format_size(bytes)));
         });
     }
@@ -339,6 +344,7 @@ pub fn treemap_view(
     live: bool,
     other_files: Option<&HashMap<String, u64>>,
     space: &[SpaceTile],
+    show_excluded: bool,
 ) {
     let visible = ui.available_rect_before_wrap().intersect(ui.clip_rect());
     if visible.width() < 2.0 || visible.height() < 2.0 {
@@ -355,6 +361,8 @@ pub fn treemap_view(
     let mut path = vec![root.name.clone()];
     let partner = ctx.partner_highlight_rel.as_deref();
     *ctx.space_hover = None;
+    // The scanned root is the box top-level files sit in. Grey, no outline.
+    painter.rect_filled(rect, 0.0, directory_grey(ui.visuals().dark_mode, 0));
     paint_children(
         ui,
         &painter,
@@ -370,11 +378,16 @@ pub fn treemap_view(
         partner,
         other_files,
         space,
+        1,
+        show_excluded,
     );
 }
 
-fn layout_values(children: &[TreeNode], live: bool) -> Vec<f64> {
-    let mut values: Vec<f64> = children.iter().map(|child| child.size as f64).collect();
+fn layout_values(children: &[TreeNode], live: bool, show_excluded: bool) -> Vec<f64> {
+    let mut values: Vec<f64> = children
+        .iter()
+        .map(|child| layout_bytes(child, show_excluded) as f64)
+        .collect();
     // A single huge directory would otherwise be re-laid-out in full on every
     // live frame. Keep the largest tiles; the finished scan draws everything.
     const LIVE_TILES: usize = 800;
@@ -389,6 +402,36 @@ fn layout_values(children: &[TreeNode], live: bool) -> Vec<f64> {
         }
     }
     values
+}
+
+/// Weight used to place a tile. Hidden excluded files contribute nothing, and
+/// a directory shrinks by the excluded files inside it so siblings stay proportional.
+fn layout_bytes(node: &TreeNode, show_excluded: bool) -> u64 {
+    if node.excluded {
+        return if show_excluded && !node.is_dir {
+            node.size
+        } else {
+            0
+        };
+    }
+    if show_excluded || !node.is_dir {
+        return node.size;
+    }
+    node.size.saturating_sub(hidden_excluded_bytes(node))
+}
+
+fn hidden_excluded_bytes(node: &TreeNode) -> u64 {
+    let mut total = 0u64;
+    for child in &node.children {
+        if child.excluded {
+            if !child.is_dir {
+                total = total.saturating_add(child.size);
+            }
+        } else if child.is_dir {
+            total = total.saturating_add(hidden_excluded_bytes(child));
+        }
+    }
+    total
 }
 
 fn paint_children(
@@ -406,8 +449,10 @@ fn paint_children(
     partner_highlight_rel: Option<&[String]>,
     other_files: Option<&HashMap<String, u64>>,
     extras: &[SpaceTile],
+    depth: usize,
+    show_excluded: bool,
 ) {
-    let mut values = layout_values(&parent.children, live);
+    let mut values = layout_values(&parent.children, live, show_excluded);
     for extra in extras {
         values.push(extra.bytes() as f64);
     }
@@ -451,6 +496,8 @@ fn paint_children(
             live,
             partner_highlight_rel,
             other_files,
+            depth,
+            show_excluded,
         );
         path.pop();
     }
@@ -470,6 +517,8 @@ fn paint_node(
     live: bool,
     partner_highlight_rel: Option<&[String]>,
     other_files: Option<&HashMap<String, u64>>,
+    depth: usize,
+    show_excluded: bool,
 ) {
     if rect.width() < 2.0 || rect.height() < 2.0 {
         return;
@@ -484,13 +533,14 @@ fn paint_node(
     } else {
         other_files.and_then(|files| sync::match_file(&rel, node.size, files))
     };
+    // Glows use this same rect as the fill. Nothing here insets or expands it.
+    let tile = rect.shrink(TILE_INSET);
 
     if node.excluded {
         hatch_rect(painter, rect, ui.visuals().weak_text_color());
     } else if nest {
-        let border = ui.visuals().window_stroke;
-        painter.rect_stroke(rect.expand(-1.0), 3.0, border, StrokeKind::Inside);
-        let inner = rect.shrink(2.0);
+        painter.rect_filled(rect, 0.0, directory_grey(ui.visuals().dark_mode, depth));
+        let inner = rect.shrink(DIR_PAD);
         // Register this folder before its children so the tile under the pointer
         // is the one that shows the tooltip.
         track_pointer(
@@ -522,27 +572,32 @@ fn paint_node(
                 partner_highlight_rel,
                 other_files,
                 &[],
+                depth + 1,
+                show_excluded,
             );
         }
     } else if node.is_dir {
-        painter.rect_filled(
-            rect.shrink(1.0),
-            2.0,
-            type_color(&node.name).gamma_multiply(0.85),
+        paint_tile_gradient(
+            painter,
+            tile,
+            color_from_rgb(readable_color_rgb(&node.name)).gamma_multiply(0.85),
         );
     } else {
-        fill_file_tile(painter, rect, &node.name);
+        paint_tile_gradient(painter, tile, color_from_rgb(file_color_rgb(&node.name)));
         if let Some(kind) = mark {
-            painter.rect_stroke(
-                rect.shrink(1.5),
-                2.0,
-                Stroke::new(2.5, match_color(kind)),
-                StrokeKind::Inside,
-            );
+            if let Some(mesh) = inset_glow_mesh(tile, match_color(kind), MATCH_GLOW_PX) {
+                painter.add(mesh);
+            }
         }
     }
 
-    maybe_partner_stroke(painter, rect, partner_highlight_rel, rel_within_root(path));
+    let glow_rect = if nest { rect } else { tile };
+    maybe_partner_glow(
+        painter,
+        glow_rect,
+        partner_highlight_rel,
+        rel_within_root(path),
+    );
     if !nest {
         track_pointer(
             ui,
@@ -560,19 +615,16 @@ fn paint_node(
     }
 }
 
-fn maybe_partner_stroke(
+fn maybe_partner_glow(
     painter: &egui::Painter,
-    r: Rect,
+    rect: Rect,
     partner_highlight_rel: Option<&[String]>,
     this_rel: Vec<String>,
 ) {
     if partner_highlight_rel == Some(this_rel.as_slice()) {
-        painter.rect_stroke(
-            r.shrink(0.5),
-            2.0,
-            Stroke::new(2.0, Color32::from_rgb(255, 210, 80)),
-            StrokeKind::Outside,
-        );
+        if let Some(mesh) = radial_glow_mesh(rect, HOVER_GLOW) {
+            painter.add(mesh);
+        }
     }
 }
 
@@ -644,12 +696,12 @@ pub fn space_legend(ui: &mut egui::Ui, tiles: &[SpaceTile]) {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::hover());
             match tile {
                 SpaceTile::Free(_) => {
-                    ui.painter().rect_filled(rect, 2.0, FREE_COLOR);
+                    ui.painter().rect_filled(rect, 0.0, FREE_COLOR);
                 }
                 SpaceTile::Gap(_) | SpaceTile::ContentGap(_) => {
                     ui.painter().rect_stroke(
                         rect,
-                        2.0,
+                        0.0,
                         Stroke::new(1.0, Color32::from_gray(160)),
                         StrokeKind::Inside,
                     );
@@ -674,7 +726,7 @@ fn paint_space_tile(
     }
     match tile {
         SpaceTile::Free(_) => {
-            painter.rect_filled(rect.shrink(1.0), 2.0, FREE_COLOR);
+            paint_tile_gradient(painter, rect.shrink(TILE_INSET), FREE_COLOR);
         }
         SpaceTile::Gap(_) | SpaceTile::ContentGap(_) => {
             painter.rect_stroke(
@@ -767,6 +819,9 @@ fn hover_tip(rel: &str, node: &TreeNode, mark: Option<MatchKind>, other_compared
         return format!("{name}\n{detail}");
     }
     let size = format_size(node.size);
+    if node.excluded {
+        return format!("{rel}\nexcluded · {size}");
+    }
     let compare = match mark {
         Some(MatchKind::Same) => "same file on the other side",
         Some(MatchKind::Different) => "same path, different size",
@@ -780,9 +835,124 @@ fn hover_tip(rel: &str, node: &TreeNode, mark: Option<MatchKind>, other_compared
     }
 }
 
-fn fill_file_tile(painter: &egui::Painter, r: Rect, name: &str) {
-    let color = type_color(file_type_bucket(name));
-    painter.rect_filled(r.shrink(1.0), 3.0, color);
+/// Each box shades from its own color at the top edge to 30% darker at the
+/// bottom edge. The fade belongs to that rectangle, so neighboring boxes
+/// do not share one gradient.
+fn paint_tile_gradient(painter: &egui::Painter, rect: Rect, color: Color32) {
+    if !rect.is_positive() {
+        return;
+    }
+    painter.add(Shape::gradient_rect(
+        rect,
+        Direction::TopDown,
+        [color, shade_darker(color, TILE_SHADE)],
+    ));
+}
+
+/// Keep hue and alpha. Multiply the color channels so the result is darker.
+fn shade_darker(color: Color32, factor: f32) -> Color32 {
+    let [r, g, b, a] = color.to_array();
+    let scale = |channel: u8| (channel as f32 * factor).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(scale(r), scale(g), scale(b), a)
+}
+
+/// Directory frame. Adjacent depths alternate so the parent's grey shows as
+/// the spacing around the box inside it. No stroke.
+fn directory_grey(dark: bool, depth: usize) -> Color32 {
+    let tone = if dark {
+        if depth % 2 == 0 {
+            68
+        } else {
+            98
+        }
+    } else if depth % 2 == 0 {
+        214
+    } else {
+        188
+    };
+    Color32::from_gray(tone)
+}
+
+/// Green (or amber) rim: solid at the outer edge, gone `depth` pixels inward.
+/// Every vertex stays on or inside `rect`.
+fn inset_glow_mesh(rect: Rect, color: Color32, depth: f32) -> Option<Mesh> {
+    if !rect.is_positive() || depth <= 0.0 {
+        return None;
+    }
+    let depth = depth.min(rect.width() * 0.5).min(rect.height() * 0.5);
+    let inner = rect.shrink(depth);
+    if !inner.is_positive() {
+        return None;
+    }
+    let outer = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    let inner_pts = [
+        inner.left_top(),
+        inner.right_top(),
+        inner.right_bottom(),
+        inner.left_bottom(),
+    ];
+    let mut mesh = Mesh::default();
+    for pos in outer {
+        mesh.colored_vertex(pos, color);
+    }
+    for pos in inner_pts {
+        mesh.colored_vertex(pos, Color32::TRANSPARENT);
+    }
+    for k in 0..4 {
+        let o0 = k as u32;
+        let o1 = ((k + 1) % 4) as u32;
+        let i0 = 4 + k as u32;
+        let i1 = 4 + ((k + 1) % 4) as u32;
+        mesh.add_triangle(o0, o1, i1);
+        mesh.add_triangle(o0, i1, i0);
+    }
+    Some(mesh)
+}
+
+/// Soft glow peaked at the center and gone at the box edge.
+fn radial_glow_mesh(rect: Rect, color: Color32) -> Option<Mesh> {
+    if !rect.is_positive() {
+        return None;
+    }
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(rect.center(), color);
+    let steps = 4;
+    let rim = perimeter(rect, steps);
+    for pos in &rim {
+        mesh.colored_vertex(*pos, Color32::TRANSPARENT);
+    }
+    let count = rim.len() as u32;
+    for i in 0..count {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % count);
+    }
+    Some(mesh)
+}
+
+fn perimeter(rect: Rect, steps_per_side: usize) -> Vec<Pos2> {
+    let mut pts = Vec::with_capacity(steps_per_side * 4);
+    let t_at = |i: usize| i as f32 / steps_per_side as f32;
+    for i in 0..steps_per_side {
+        let t = t_at(i);
+        pts.push(Pos2::new(rect.left() + rect.width() * t, rect.top()));
+    }
+    for i in 0..steps_per_side {
+        let t = t_at(i);
+        pts.push(Pos2::new(rect.right(), rect.top() + rect.height() * t));
+    }
+    for i in 0..steps_per_side {
+        let t = t_at(i);
+        pts.push(Pos2::new(rect.right() - rect.width() * t, rect.bottom()));
+    }
+    for i in 0..steps_per_side {
+        let t = t_at(i);
+        pts.push(Pos2::new(rect.left(), rect.bottom() - rect.height() * t));
+    }
+    pts
 }
 
 pub fn hatch_rect(painter: &egui::Painter, rect: Rect, color: Color32) {
@@ -814,6 +984,141 @@ fn hatch_shapes(rect: Rect, color: Color32, fill: f32) -> Vec<egui::Shape> {
         x += spacing;
     }
     shapes
+}
+
+pub enum PatternIcon {
+    Book,
+    Gear { slashed: bool },
+}
+
+pub struct PatternEditResult {
+    pub submitted: bool,
+    pub icon_clicked: bool,
+    pub rect: Rect,
+}
+
+/// One VS Code-style pattern row: a label, a full-width field, and an icon
+/// sitting inside the field's right edge.
+pub fn pattern_edit(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    hint: &str,
+    text: &mut String,
+    icon: PatternIcon,
+    icon_tip: &str,
+) -> PatternEditResult {
+    ui.label(egui::RichText::new(label).color(Color32::from_gray(204)));
+    ui.add_space(3.0);
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 4.0, Color32::from_rgb(60, 60, 60));
+    ui.painter().rect_stroke(
+        rect,
+        4.0,
+        Stroke::new(1.0, Color32::from_rgb(78, 78, 78)),
+        StrokeKind::Inside,
+    );
+
+    let icon_w = 28.0;
+    let text_rect = Rect::from_min_max(
+        rect.left_top(),
+        Pos2::new(rect.right() - icon_w, rect.bottom()),
+    );
+    let text_response = ui.put(
+        text_rect,
+        egui::TextEdit::singleline(text)
+            .id_source(id)
+            .hint_text(hint)
+            .frame(egui::Frame::NONE)
+            .margin(egui::Margin::symmetric(8, 4))
+            .align(egui::Align2::LEFT_CENTER)
+            .desired_width(text_rect.width()),
+    );
+    let submitted =
+        text_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+    let icon_rect = Rect::from_min_max(
+        Pos2::new(rect.right() - icon_w, rect.top()),
+        rect.right_bottom(),
+    );
+    let clickable = matches!(icon, PatternIcon::Gear { .. });
+    let icon_response = ui.interact(
+        icon_rect,
+        ui.scope_id().with((id, "icon")),
+        if clickable {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if icon_response.hovered() {
+        icon_response.clone().on_hover_text(icon_tip);
+        if clickable {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    let color = if icon_response.hovered() {
+        Color32::from_gray(235)
+    } else {
+        Color32::from_gray(176)
+    };
+    match icon {
+        PatternIcon::Book => paint_book(ui.painter(), icon_rect, color),
+        PatternIcon::Gear { slashed } => paint_gear(ui.painter(), icon_rect, color, slashed),
+    }
+    PatternEditResult {
+        submitted,
+        icon_clicked: icon_response.clicked(),
+        rect,
+    }
+}
+
+fn paint_book(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.2, color);
+    let top = c.y - 5.5;
+    let bottom = c.y + 5.0;
+    let left = c.x - 7.0;
+    let right = c.x + 7.0;
+    painter.line_segment([Pos2::new(c.x, top + 1.0), Pos2::new(c.x, bottom)], stroke);
+    painter.line_segment(
+        [Pos2::new(c.x, top + 1.0), Pos2::new(left, top + 3.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [Pos2::new(left, top + 3.0), Pos2::new(left, bottom)],
+        stroke,
+    );
+    painter.line_segment([Pos2::new(left, bottom), Pos2::new(c.x, bottom)], stroke);
+    painter.line_segment(
+        [Pos2::new(c.x, top + 1.0), Pos2::new(right, top + 3.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [Pos2::new(right, top + 3.0), Pos2::new(right, bottom)],
+        stroke,
+    );
+    painter.line_segment([Pos2::new(right, bottom), Pos2::new(c.x, bottom)], stroke);
+}
+
+fn paint_gear(painter: &egui::Painter, rect: Rect, color: Color32, slashed: bool) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.15, color);
+    painter.circle_stroke(c, 3.3, stroke);
+    painter.circle_stroke(c, 1.35, stroke);
+    for i in 0..8 {
+        let angle = i as f32 * std::f32::consts::TAU / 8.0;
+        let dir = Vec2::new(angle.cos(), angle.sin());
+        painter.line_segment([c + dir * 3.1, c + dir * 5.5], stroke);
+    }
+    if slashed {
+        painter.line_segment(
+            [c + Vec2::new(-6.0, 6.0), c + Vec2::new(6.0, -6.0)],
+            Stroke::new(1.5, color),
+        );
+    }
 }
 
 fn format_size(n: u64) -> String {
@@ -946,5 +1251,69 @@ mod tests {
             saw_selection,
             "clicking a row should select a path in the tree, last selection was {selected:?}"
         );
+    }
+
+    #[test]
+    fn hidden_excluded_files_drop_out_of_the_layout() {
+        let mut folder = TreeNode::new_dir("photos");
+        folder.children.push(TreeNode::file("keep.jpg", 100));
+        let mut junk = TreeNode::file(".DS_Store", 8);
+        junk.excluded = true;
+        folder.children.push(junk);
+        folder.size = 108;
+
+        let hidden = layout_values(&folder.children, false, false);
+        assert_eq!(hidden, vec![100.0, 0.0]);
+        assert_eq!(layout_bytes(&folder, false), 100);
+
+        let shown = layout_values(&folder.children, false, true);
+        assert_eq!(shown, vec![100.0, 8.0]);
+        assert_eq!(layout_bytes(&folder, true), 108);
+    }
+
+    #[test]
+    fn tile_bottom_is_thirty_percent_darker() {
+        let color = Color32::from_rgba_unmultiplied(200, 80, 40, 255);
+        let bottom = shade_darker(color, TILE_SHADE);
+        assert_eq!(bottom, Color32::from_rgba_unmultiplied(140, 56, 28, 255));
+        assert_eq!(shade_darker(color, 1.0), color);
+    }
+
+    #[test]
+    fn glows_stay_inside_the_tile_rect() {
+        let rect = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(50.0, 80.0));
+        let edge = inset_glow_mesh(rect, Color32::from_rgb(90, 220, 130), MATCH_GLOW_PX).unwrap();
+        let bounds = edge.calc_bounds();
+        assert_eq!(bounds.min, rect.min);
+        assert_eq!(bounds.max, rect.max);
+        let inner = rect.shrink(MATCH_GLOW_PX);
+        let inner_corners = [
+            inner.left_top(),
+            inner.right_top(),
+            inner.right_bottom(),
+            inner.left_bottom(),
+        ];
+        for (vertex, corner) in edge.vertices.iter().skip(4).zip(inner_corners) {
+            assert_eq!(vertex.pos, corner);
+        }
+
+        let hover = radial_glow_mesh(rect, HOVER_GLOW).unwrap();
+        let hover_bounds = hover.calc_bounds();
+        assert!(hover_bounds.min.x >= rect.left() - 0.01);
+        assert!(hover_bounds.min.y >= rect.top() - 0.01);
+        assert!(hover_bounds.max.x <= rect.right() + 0.01);
+        assert!(hover_bounds.max.y <= rect.bottom() + 0.01);
+    }
+
+    #[test]
+    fn directory_frames_alternate_grey_without_depending_on_glow() {
+        assert_ne!(directory_grey(true, 0), directory_grey(true, 1));
+        assert_eq!(directory_grey(true, 0), directory_grey(true, 2));
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(40.0, 30.0));
+        let inner = rect.shrink(DIR_PAD);
+        assert_eq!(inner.left(), rect.left() + DIR_PAD);
+        assert_eq!(inner.top(), rect.top() + DIR_PAD);
+        // The pad is the frame. A glow must not be what produces it.
+        assert_ne!(DIR_PAD, MATCH_GLOW_PX);
     }
 }
