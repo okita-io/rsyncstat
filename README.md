@@ -1,94 +1,167 @@
+<div align="center">
+
 # RSyncStat
 
-RSyncStat is a native Rust application that combines a WinDirStat-style disk map with two-way folder sync (planned). **M0** (this branch) is a spike: scan one local folder with gitignore-style exclude presets, show a squarified treemap, directory tree, file-type legend, and hatched tiles for excluded paths. No sync yet.
+**See your folders. See your sync. One map.**
 
-The full product spec lives in [docs/SPEC.md](docs/SPEC.md).
+A native Rust desktop app that fuses a WinDirStat-style disk treemap with two-way folder sync, so the space map *is* the sync preview.
+
+[![CI](https://github.com/okita-io/rsyncstat/actions/workflows/ci.yml/badge.svg)](https://github.com/okita-io/rsyncstat/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/okita-io/rsyncstat?color=blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.95%2B-orange?logo=rust)](rust-toolchain.toml)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](#platform-notes)
+[![egui](https://img.shields.io/badge/UI-egui%200.37-8A2BE2)](https://github.com/emilk/egui)
+[![Last commit](https://img.shields.io/github/last-commit/okita-io/rsyncstat)](https://github.com/okita-io/rsyncstat/commits/main)
+[![Issues](https://img.shields.io/github/issues/okita-io/rsyncstat)](https://github.com/okita-io/rsyncstat/issues)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+</div>
+
+> **Status:** early development. Scanning, the treemap and the folder tree work today. One-way copy from folder A to B (never overwriting) works; true two-way sync with a stored snapshot is still to come. See [Roadmap](#roadmap).
+
+## Why
+
+Disk visualizers show where the space goes but never move a byte. Two-way sync tools move bytes but show the result as a list. RSyncStat puts both on one screen so you can see what a sync will do, and how big it is, before you run it. The full design lives in [docs/SPEC.md](docs/SPEC.md).
+
+## Features
+
+**Disk map**
+- Squarified treemap with hit testing, linked to a directory tree and a file-type legend
+- Live results: the tree and treemap fill in while the scan is still running
+- Parallel scanner (up to two workers per CPU core) that never descends into excluded directories
+- Deterministic, readable per-extension colors
+- Dithered tiles on one shared pixel grid, with consistent match outlines and hover highlight
+- Elided path display for long paths
+
+**Exclude filters (first class)**
+- Gitignore-style rules via the `ignore` crate
+- Built-in presets: `*.lancedb`, `node_modules/`, `target/`, `.venv/`, system junk files
+- Excluded entries stay visible, drawn with a hatch pattern, so you can see what is skipped
+
+**Two panes and compare**
+- Side-by-side source A / B panes, each with its own folder controls and rescan
+- Pane compare and sync planning in the app (in progress)
+- Trash instead of delete, via the `trash` crate
+
+**Keyboard first**
+- Tab follows the visual layout, with high-contrast focus rings
+- Windows/GTK-style Alt mnemonics (egui has no built-in access keys)
+- Ctrl-based global shortcuts that avoid Hyprland's Super bindings; F1 opens the cheat sheet
+- File menu, Escape to cancel scans
+
+**Cross-platform**
+- macOS, Windows, and Linux including Arch/Omarchy on Hyprland (Wayland)
+- GPU rendering through eframe + wgpu
+
+## Install
+
+There are no prebuilt releases yet. Build from source.
+
+### Prerequisites
+
+- Rust **stable 1.95 or newer** (required by eframe/egui 0.37; see `rust-toolchain.toml`)
+- Platform libraries for the GUI (see [Platform notes](#platform-notes))
+
+### Build and run
+
+```bash
+git clone https://github.com/okita-io/rsyncstat
+cd rsyncstat
+cargo run --release -p rsyncstat-app
+```
+
+The release binary is `target/release/rsyncstat` (`rsyncstat.exe` on Windows). Use **Open folder…** to pick a root.
 
 ## Workspace layout
 
-| Crate | M0 status |
-|-------|-----------|
-| `rsyncstat-model` | Scan tree types |
-| `rsyncstat-filter` | Built-in exclude presets (`ignore` gitignore builder) |
+| Crate | Role |
+|-------|------|
+| `rsyncstat-model` | Scan tree types, file colors, byte and path formatting |
+| `rsyncstat-filter` | Built-in exclude presets and gitignore-style rules |
 | `rsyncstat-scan` | Parallel walk, prunes excluded directories |
-| `rsyncstat-treemap` | Squarified layout + hit testing |
-| `rsyncstat-app` | eframe/egui 0.37 + wgpu desktop UI |
-| `rsyncstat-index`, `reconcile`, `plan`, `exec`, `transport` | Stubs |
-| `rsyncstat-agent` | Stub binary (M3) |
+| `rsyncstat-treemap` | Squarified layout and hit testing |
+| `rsyncstat-plan` | Compare two trees and decide which files to copy (pure logic) |
+| `rsyncstat-exec` | Run a plan: atomic copy, hash check, retries, cancel |
+| `rsyncstat-app` | eframe/egui + wgpu desktop UI |
 
-## Prerequisites
+Inside `rsyncstat-app`, `src/app/` holds window state and behavior split by concern (`scan_ctl`, `sync_ctl`, `input`, `frame`, `pane`, `pane_view`), and `src/ui/` holds the widgets (`treemap`, `tree_view`, `legend`, `dither`, `diff`, `patterns`). The index, reconcile and transport crates will be added when their milestones start.
 
-- Rust **stable ≥ 1.95** (required by eframe/egui 0.37; see `rust-toolchain.toml` and workspace `rust-version`)
-- Platform libraries for the GUI (see below)
+## Roadmap
 
-## Build
+- [x] Scanner, treemap, tree, legend, exclude presets
+- [x] Keyboard navigation and mnemonics
+- [ ] Snapshot index and three-way reconcile (Unison-style)
+- [ ] Visual sync plan you approve before anything is written
+- [ ] Safe execution: trash, atomic writes, resumable runs
+- [ ] Remote host over SSH via the agent
 
-From the repository root:
+Milestones are detailed in [docs/SPEC.md](docs/SPEC.md#mvp-milestones).
 
-```bash
-cargo build --release -p rsyncstat-app
-```
-
-The binary is `target/release/rsyncstat` (or `rsyncstat.exe` on Windows).
-
-## Run
+## Development
 
 ```bash
-cargo run -p rsyncstat-app
+cargo fmt --all -- --check
+cargo test --workspace
+cargo build --workspace --locked
 ```
 
-Use **Open folder…** to pick a root. The scanner uses up to two workers per CPU core, applies default exclude presets (including `*.lancedb`, `node_modules/`, `target/`, `.venv/`, system junk), and does not descend into excluded directories. The directory list and treemap fill in while the walk is still running. Excluded entries appear in the tree and treemap with a hatch pattern.
+CI runs on Ubuntu, macOS and Windows. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
 
 ## Platform notes
 
 ### macOS
 
-- Install Xcode command line tools if Rust was not installed via `rustup`.
+- Install the Xcode command line tools if Rust was not installed via `rustup`.
 - First run may prompt for folder access depending on what you scan.
-- Build: `cargo build --release -p rsyncstat-app`
-- Hyprland-style keyboard issues do not apply on macOS.
 
 ### Windows
 
-- Use a recent Visual Studio Build Tools install (for the MSVC linker) if `rustup` did not configure it.
+- Install Visual Studio Build Tools (MSVC linker) if `rustup` did not configure it.
 - The wgpu 30 stack needs a single `windows` crate version (0.62.x) for both `wgpu-hal` and `gpu-allocator`. If `cargo update` reintroduces `windows` 0.58, run `cargo update -p windows@0.58.0 --precise 0.62.2` and commit `Cargo.lock`.
-- Long paths: the scanner uses the standard library; future milestones will use verbatim `\\?\` paths where needed.
 - Run: `target\release\rsyncstat.exe`
 
 ### Linux (including Arch / Omarchy / Hyprland)
 
-On Arch:
+Arch:
 
 ```bash
 sudo pacman -S --needed base-devel pkgconf gtk3 libxkbcommon wayland
 ```
 
-On Debian/Ubuntu:
+Debian/Ubuntu:
 
 ```bash
 sudo apt install libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 ```
 
-**Hyprland (Wayland):** M0 must be exercised on a real Hyprland session. There is an open egui report that keyboard input is ignored on Hyprland ([#8249](https://github.com/emilk/egui/issues/8249)); confirm focus and typing in text fields after upgrading to eframe 0.37. A related Wayland repaint stall on hidden workspaces was addressed in 0.37 ([#5136](https://github.com/emilk/egui/issues/5136)).
+**Hyprland (Wayland):** there is an open egui report that keyboard input is ignored on Hyprland ([#8249](https://github.com/emilk/egui/issues/8249)); confirm focus and typing in text fields on a real session. A related Wayland repaint stall on hidden workspaces was addressed in egui 0.37 ([#5136](https://github.com/emilk/egui/issues/5136)).
 
-Typical Hyprland launch (from a built tree):
+## Contributing and security
 
-```bash
-cargo run -p rsyncstat-app
-```
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
 
-Ensure `WLR_NO_HARDWARE_CURSORS=1` only if your compositor docs require it for fractional scaling; not usually needed for a smoke test.
+## Acknowledgements
 
-## Tests
+RSyncStat stands on a lot of prior work.
 
-```bash
-cargo test -p rsyncstat-filter -p rsyncstat-treemap
-cargo test --workspace
-cargo build --workspace
-```
+**Inspiration**
+- [WinDirStat](https://windirstat.net/), [QDirStat](https://github.com/shundhammer/qdirstat), [GrandPerspective](https://grandperspectiv.sourceforge.net/) and [WizTree](https://diskanalyzer.com/) for the disk-map interaction model
+- [Unison](https://github.com/bcpierce00/unison) for the archive-based, three-way sync design
+- [FreeFileSync](https://freefilesync.org/), [Syncthing](https://syncthing.net/), [rclone bisync](https://rclone.org/bisync/) and [Mutagen](https://mutagen.io/) for safety ideas
 
-CI runs the unit tests and a full workspace build on Ubuntu, macOS, and Windows.
+**Algorithms**
+- Bruls, Huizing and van Wijk, [*Squarified Treemaps*](https://www.win.tue.nl/~vanwijk/stm.pdf) (2000)
+
+**Libraries**
+- [egui / eframe](https://github.com/emilk/egui) by Emil Ernerfeldt and contributors (MIT/Apache-2.0)
+- [wgpu](https://github.com/gfx-rs/wgpu) (MIT/Apache-2.0)
+- [egui_ltreeview](https://github.com/LennysLounge/egui_ltreeview)
+- [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) by Andrew Gallant (Unlicense/MIT)
+- [rayon](https://github.com/rayon-rs/rayon), [crossbeam](https://github.com/crossbeam-rs/crossbeam), [serde](https://serde.rs/), [tokio](https://tokio.rs/)
+- [BLAKE3](https://github.com/BLAKE3-team/BLAKE3), [redb](https://github.com/cberner/redb), [trash-rs](https://github.com/Byron/trash-rs), [rfd](https://github.com/PolyMeilex/rfd), [postcard](https://github.com/jamesmunns/postcard)
+
+Exact versions and transitive dependencies are in [Cargo.lock](Cargo.lock). All trademarks belong to their owners; RSyncStat is not affiliated with any project listed here.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE) © 2026 okita.io
