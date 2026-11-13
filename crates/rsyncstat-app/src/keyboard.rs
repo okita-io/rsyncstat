@@ -220,30 +220,62 @@ pub fn layout_job_for_label(
         color,
         ..Default::default()
     };
-    let chars: Vec<char> = parsed.display.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if show_underline && parsed.underline_index == Some(i) {
-            let ch = chars[i].to_string();
+    for run in label_runs(&parsed.display, parsed.underline_index, show_underline) {
+        if run.underline {
             job.append(
-                &ch,
+                &run.text,
                 0.0,
                 TextFormat {
                     underline: underline_stroke,
                     ..base.clone()
                 },
             );
-            i += 1;
         } else {
-            let start = i;
-            while i < chars.len() && parsed.underline_index != Some(i) {
-                i += 1;
-            }
-            let chunk: String = chars[start..i].iter().collect();
-            job.append(&chunk, 0.0, base.clone());
+            job.append(&run.text, 0.0, base.clone());
         }
     }
     job
+}
+
+struct LabelRun {
+    text: String,
+    underline: bool,
+}
+
+/// Split a label into plain and underlined pieces.
+///
+/// When the underline is hidden, the access-key character stays in the plain
+/// run. Stopping on that index without consuming it loops forever on an empty
+/// chunk, which is what kept the first menu button from finishing.
+fn label_runs(
+    display: &str,
+    underline_index: Option<usize>,
+    show_underline: bool,
+) -> Vec<LabelRun> {
+    let chars: Vec<char> = display.chars().collect();
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if show_underline && underline_index == Some(i) {
+            runs.push(LabelRun {
+                text: chars[i].to_string(),
+                underline: true,
+            });
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && !(show_underline && underline_index == Some(i)) {
+            i += 1;
+        }
+        if start < i {
+            runs.push(LabelRun {
+                text: chars[start..i].iter().collect(),
+                underline: false,
+            });
+        }
+    }
+    runs
 }
 
 pub fn show_mnemonic_underlines(state: &KeyboardState, ctx: &egui::Context) -> bool {
@@ -559,6 +591,26 @@ mod tests {
         assert_eq!(p.display, "Scan");
         assert_eq!(p.access_key, Some('s'));
         assert_eq!(p.underline_index, Some(0));
+    }
+
+    #[test]
+    fn hidden_underline_stays_one_run() {
+        let runs = label_runs("Open source", Some(5), false);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "Open source");
+        assert!(!runs[0].underline);
+    }
+
+    #[test]
+    fn shown_underline_splits_around_the_access_key() {
+        let runs = label_runs("Open source", Some(5), true);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].text, "Open ");
+        assert!(!runs[0].underline);
+        assert_eq!(runs[1].text, "s");
+        assert!(runs[1].underline);
+        assert_eq!(runs[2].text, "ource");
+        assert!(!runs[2].underline);
     }
 
     #[test]
