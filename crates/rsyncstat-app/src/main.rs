@@ -7,8 +7,8 @@ mod volume;
 
 use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use eframe::egui::{self, Sense, Vec2};
-use rsyncstat_filter::{FilterSet, RuleLevel};
-use rsyncstat_model::{file_type_bucket, TreeNode};
+use rsyncstat_filter::{FilterSet, PatternOptions};
+use rsyncstat_model::{file_type_id, FileTypeId, TreeNode};
 use rsyncstat_scan::{scan_root_async, ScanUpdate};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -76,7 +76,7 @@ struct PaneState {
     selected_path: Option<Vec<String>>,
     hover_path: Option<Vec<String>>,
     recent_dirs: VecDeque<String>,
-    legend: HashMap<&'static str, u64>,
+    legend: HashMap<FileTypeId, u64>,
     /// Relative path → size for files that are in scope. Used to highlight matches.
     file_sizes: Arc<HashMap<String, u64>>,
     /// When set, excluded files are drawn on this pane's map. Off, their space
@@ -194,7 +194,7 @@ impl PaneState {
                 }
                 if let Some(name) = entry.rel.file_name() {
                     let name = name.to_string_lossy();
-                    *self.legend.entry(file_type_bucket(&name)).or_default() += entry.size;
+                    *self.legend.entry(file_type_id(&name)).or_default() += entry.size;
                 }
             }
         }
@@ -314,8 +314,12 @@ struct RsyncStatApp {
     sync_method: SyncMethod,
     /// Comma-separated globs. Empty keeps every file that is not excluded.
     files_include: String,
+    include_options: PatternOptions,
     /// Comma-separated globs. These replace the old type and directory exclude fields.
     files_exclude: String,
+    exclude_options: PatternOptions,
+    /// Set when a regular expression in either field could not be compiled.
+    pattern_warning: String,
     /// Built-in excludes such as `.DS_Store`, `node_modules`, and `target`.
     use_preset_excludes: bool,
     compare: Option<CompareSummary>,
@@ -342,6 +346,15 @@ struct RsyncStatApp {
     kbd: keyboard::KeyboardState,
 }
 
+fn pattern_options_key(options: PatternOptions) -> String {
+    format!(
+        "{}{}{}",
+        u8::from(options.match_case),
+        u8::from(options.whole_word),
+        u8::from(options.regex)
+    )
+}
+
 impl RsyncStatApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
@@ -353,7 +366,10 @@ impl RsyncStatApp {
             active_pane: ActivePane::Source,
             sync_method: SyncMethod::AtoB,
             files_include: String::new(),
+            include_options: PatternOptions::default(),
             files_exclude: String::new(),
+            exclude_options: PatternOptions::default(),
+            pattern_warning: String::new(),
             use_preset_excludes: true,
             compare: None,
             compare_dirty: false,
@@ -384,16 +400,6 @@ impl RsyncStatApp {
                 }
             }
             keyboard::KeyAction::ToggleDualPane => self.dual_pane = !self.dual_pane,
-            keyboard::KeyAction::ToggleMnemonicVis => {
-                self.kbd.mnemonic_vis = match self.kbd.mnemonic_vis {
-                    keyboard::MnemonicVisibility::Always => {
-                        keyboard::MnemonicVisibility::WhenAltHeld
-                    }
-                    keyboard::MnemonicVisibility::WhenAltHeld => {
-                        keyboard::MnemonicVisibility::Always
-                    }
-                };
-            }
             keyboard::KeyAction::SetActivePane(pane) => self.active_pane = pane,
             keyboard::KeyAction::FocusTreeTab(pane) => {
                 self.active_pane = pane;
@@ -448,16 +454,6 @@ impl RsyncStatApp {
             FocusId::OpenSourceA => self.pick_folder(ctx, ActivePane::Source),
             FocusId::OpenTargetB => self.pick_folder(ctx, ActivePane::Target),
             FocusId::DualPane => self.dual_pane = !self.dual_pane,
-            FocusId::MnemonicVisToggle => {
-                self.kbd.mnemonic_vis = match self.kbd.mnemonic_vis {
-                    keyboard::MnemonicVisibility::Always => {
-                        keyboard::MnemonicVisibility::WhenAltHeld
-                    }
-                    keyboard::MnemonicVisibility::WhenAltHeld => {
-                        keyboard::MnemonicVisibility::Always
-                    }
-                };
-            }
             FocusId::ApplyRescan => {
                 if !self.syncing {
                     self.apply_excludes();
@@ -792,10 +788,12 @@ impl RsyncStatApp {
 
     fn rules_key(&self) -> String {
         format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             self.sync_method.label(),
             self.files_include,
+            pattern_options_key(self.include_options),
             self.files_exclude,
+            pattern_options_key(self.exclude_options),
             self.use_preset_excludes
         )
     }
@@ -822,7 +820,9 @@ impl RsyncStatApp {
                 self.sync_method,
                 &sync::rules_from_patterns(
                     &self.files_include,
+                    self.include_options,
                     &self.files_exclude,
+                    self.exclude_options,
                     self.use_preset_excludes,
                 ),
             ),
@@ -834,13 +834,15 @@ impl RsyncStatApp {
         if self.syncing {
             return;
         }
-        let lines = sync::filter_lines(
+        let (filter, errors) = FilterSet::from_rules(
             &self.files_include,
+            self.include_options,
             &self.files_exclude,
+            self.exclude_options,
             self.use_preset_excludes,
         );
-        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-        self.filter = Arc::new(FilterSet::from_user_lines(&borrowed, RuleLevel::Profile));
+        self.filter = Arc::new(filter);
+        self.pattern_warning = errors.join("\n");
         if let Some(path) = self.source.root.clone() {
             self.start_scan(ActivePane::Source, path);
         }
@@ -1037,62 +1039,6 @@ impl RsyncStatApp {
         }
         tiles
     }
-
-    fn hover_status(&self) -> Option<String> {
-        if let Some(text) = self.source.space_hover.as_ref() {
-            if self.source.hover_path.is_none() {
-                return Some(format!("Hover A: {text}"));
-            }
-        }
-        if self.dual_pane {
-            if let Some(text) = self.target.space_hover.as_ref() {
-                if self.target.hover_path.is_none() && self.source.hover_path.is_none() {
-                    return Some(format!("Hover B: {text}"));
-                }
-            }
-        }
-        let (label, pane, other, other_ready) = if self.source.hover_path.is_some() {
-            (
-                "A",
-                &self.source,
-                &self.target.file_sizes,
-                self.target.tree.is_some(),
-            )
-        } else if self.target.hover_path.is_some() {
-            (
-                "B",
-                &self.target,
-                &self.source.file_sizes,
-                self.source.tree.is_some(),
-            )
-        } else {
-            return None;
-        };
-        let path = pane.hover_path.as_ref()?;
-        let node = pane
-            .tree
-            .as_ref()
-            .and_then(|tree| find_by_path(tree, path))?;
-        let rel = path.iter().skip(1).cloned().collect::<Vec<_>>().join("/");
-        if node.is_dir {
-            return Some(format!("Hover {label}: {rel}/"));
-        }
-        let mark = if other_ready {
-            sync::match_file(&rel, node.size, other)
-        } else {
-            None
-        };
-        let compare = match mark {
-            Some(sync::MatchKind::Same) => "same file on the other side",
-            Some(sync::MatchKind::Different) => "same path, different size",
-            None if other_ready => "only in this folder",
-            None => "not compared yet",
-        };
-        Some(format!(
-            "Hover {label}: {rel} — {} · {compare}",
-            format_bytes(node.size)
-        ))
-    }
 }
 
 impl eframe::App for RsyncStatApp {
@@ -1115,65 +1061,8 @@ impl eframe::App for RsyncStatApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let content_diff = self.content_diff();
-        let show_mnemonic = keyboard::show_mnemonic_underlines(&self.kbd, ui.ctx());
+        let show_mnemonic = true;
         egui::Panel::top("menu").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let r = keyboard::mnemonic_button(
-                    ui,
-                    keyboard::FocusId::OpenSourceA,
-                    keyboard::raw_label_for(keyboard::FocusId::OpenSourceA),
-                    show_mnemonic,
-                );
-                self.paint_focus_if(ui, r.rect, keyboard::FocusId::OpenSourceA);
-                if r.clicked() {
-                    self.pick_folder(ui.ctx(), ActivePane::Source);
-                }
-                if self.dual_pane {
-                    let r = keyboard::mnemonic_button(
-                        ui,
-                        keyboard::FocusId::OpenTargetB,
-                        keyboard::raw_label_for(keyboard::FocusId::OpenTargetB),
-                        show_mnemonic,
-                    );
-                    self.paint_focus_if(ui, r.rect, keyboard::FocusId::OpenTargetB);
-                    if r.clicked() {
-                        self.pick_folder(ui.ctx(), ActivePane::Target);
-                    }
-                }
-                ui.separator();
-                let r = keyboard::mnemonic_checkbox(
-                    ui,
-                    keyboard::FocusId::DualPane,
-                    keyboard::raw_label_for(keyboard::FocusId::DualPane),
-                    &mut self.dual_pane,
-                    show_mnemonic,
-                );
-                self.paint_focus_if(ui, r.rect, keyboard::FocusId::DualPane);
-                let mut underline_always =
-                    matches!(self.kbd.mnemonic_vis, keyboard::MnemonicVisibility::Always);
-                let r = keyboard::mnemonic_checkbox(
-                    ui,
-                    keyboard::FocusId::MnemonicVisToggle,
-                    keyboard::raw_label_for(keyboard::FocusId::MnemonicVisToggle),
-                    &mut underline_always,
-                    show_mnemonic,
-                );
-                self.paint_focus_if(ui, r.rect, keyboard::FocusId::MnemonicVisToggle);
-                if r.changed() {
-                    self.kbd.mnemonic_vis = if underline_always {
-                        keyboard::MnemonicVisibility::Always
-                    } else {
-                        keyboard::MnemonicVisibility::WhenAltHeld
-                    };
-                }
-                ui.separator();
-                ui.colored_label(egui::Color32::from_rgb(90, 220, 130), "■");
-                ui.label("same file");
-                ui.colored_label(egui::Color32::from_rgb(240, 170, 60), "■");
-                ui.label("different size");
-                ui.separator();
-                ui.weak("Names and sizes appear on hover.");
-            });
             ui.horizontal_wrapped(|ui| {
                 ui.label(keyboard::raw_label_for(keyboard::FocusId::SyncMethod));
                 let combo = egui::ComboBox::from_id_salt("sync_method")
@@ -1234,32 +1123,16 @@ impl eframe::App for RsyncStatApp {
                     }
                 }
                 ui.weak(&self.sync_status);
+                ui.separator();
+                let r = keyboard::mnemonic_checkbox(
+                    ui,
+                    keyboard::FocusId::DualPane,
+                    keyboard::raw_label_for(keyboard::FocusId::DualPane),
+                    &mut self.dual_pane,
+                    show_mnemonic,
+                );
+                self.paint_focus_if(ui, r.rect, keyboard::FocusId::DualPane);
             });
-            if let Some(compare) = &self.compare {
-                ui.label(format!(
-                    "Compare: {} same · {} different size · {} only in A · {} only in B",
-                    compare.same, compare.different, compare.only_a, compare.only_b
-                ));
-            }
-            if let Some(diff) = &content_diff {
-                ui.label(space_summary(diff));
-            }
-            if let Some(plan) = &self.preview {
-                let stale = self.preview_key != self.rules_key();
-                let stale = if stale { " · preview out of date" } else { "" };
-                let held = if self.sync_method == SyncMethod::BothWays {
-                    format!(", {} size mismatches left as-is", plan.different)
-                } else {
-                    String::new()
-                };
-                ui.label(format!(
-                    "Plan: {} A→B, {} B→A, {} same{held}, {} excluded{stale}",
-                    plan.a_to_b.len(),
-                    plan.b_to_a.len(),
-                    plan.same,
-                    plan.excluded,
-                ));
-            }
             if !self.mismatched_files.is_empty() {
                 let title = match sync::mismatch_list_path() {
                     Some(path) => format!(
@@ -1322,9 +1195,6 @@ impl eframe::App for RsyncStatApp {
             } else if self.dual_pane {
                 ui.label(&self.target.idle_status);
             }
-            if let Some(hover) = self.hover_status() {
-                ui.label(hover);
-            }
             if let Some(warning) = self.source.warnings.last() {
                 ui.weak(format!("A: {warning}"));
             }
@@ -1335,9 +1205,9 @@ impl eframe::App for RsyncStatApp {
             }
         });
 
-        // The status line above already read last frame's hover. Drop it now so
-        // a pointer that has left the map does not keep the last box glowing.
-        // This frame's tree and map write a fresh hover while they are painted.
+        // Drop last frame's hover so a pointer that has left the map does not
+        // keep the last box glowing. This frame's tree and map write a fresh
+        // hover while they are painted.
         let source_hover = self.source.hover_path.clone();
         let target_hover = self.target.hover_path.clone();
         self.source.hover_path = None;
@@ -1350,7 +1220,13 @@ impl eframe::App for RsyncStatApp {
         let active_stats_paths = self.pane(active).stats.paths;
         let active_stats_files = self.pane(active).stats.files;
         let active_started = self.pane(active).started;
-        let active_legend = self.pane(active).legend.clone();
+        let type_rows = {
+            let mut legends = vec![&self.source.legend];
+            if self.dual_pane {
+                legends.push(&self.target.legend);
+            }
+            ui::merged_type_rows(&legends)
+        };
         let partner_rel = Self::partner_highlight_rel(match active {
             ActivePane::Source => &target_hover,
             ActivePane::Target => &source_hover,
@@ -1383,18 +1259,20 @@ impl eframe::App for RsyncStatApp {
                         self.kbd.focused = keyboard::FocusId::TreeTabA;
                     }
                     if self.dual_pane {
-                        let r = keyboard::mnemonic_selectable(
-                            ui,
-                            keyboard::FocusId::TreeTabB,
-                            keyboard::raw_label_for(keyboard::FocusId::TreeTabB),
-                            active == ActivePane::Target,
-                            show_mnemonic,
-                        );
-                        self.paint_focus_if(ui, r.rect, keyboard::FocusId::TreeTabB);
-                        if r.clicked() {
-                            self.active_pane = ActivePane::Target;
-                            self.kbd.focused = keyboard::FocusId::TreeTabB;
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let r = keyboard::mnemonic_selectable(
+                                ui,
+                                keyboard::FocusId::TreeTabB,
+                                keyboard::raw_label_for(keyboard::FocusId::TreeTabB),
+                                active == ActivePane::Target,
+                                show_mnemonic,
+                            );
+                            self.paint_focus_if(ui, r.rect, keyboard::FocusId::TreeTabB);
+                            if r.clicked() {
+                                self.active_pane = ActivePane::Target;
+                                self.kbd.focused = keyboard::FocusId::TreeTabB;
+                            }
+                        });
                     }
                 });
                 ui.separator();
@@ -1418,8 +1296,9 @@ impl eframe::App for RsyncStatApp {
                     "files to include",
                     "*.rs, src/**",
                     &mut self.files_include,
+                    &self.include_options,
                     ui::PatternIcon::Book,
-                    "Comma-separated patterns. Empty includes every file that is not excluded. Example: *.rs, src/**",
+                    "Comma-separated patterns. Empty includes every file that is not excluded. Aa matches case, ab matches a whole word, .* is a regular expression.",
                 );
                 self.paint_focus_if(ui, include.rect, keyboard::FocusId::ExcludeTypes);
                 ui.add_space(8.0);
@@ -1434,6 +1313,7 @@ impl eframe::App for RsyncStatApp {
                     "files to exclude",
                     "*.log, node_modules",
                     &mut self.files_exclude,
+                    &self.exclude_options,
                     ui::PatternIcon::Gear {
                         slashed: !self.use_preset_excludes,
                     },
@@ -1461,16 +1341,33 @@ impl eframe::App for RsyncStatApp {
                     .inner;
                 self.paint_focus_if(ui, apply.rect, keyboard::FocusId::ApplyRescan);
                 if !self.syncing {
+                    let mut refresh = false;
+                    if let Some(toggle) = include.toggled {
+                        self.include_options.flip(toggle);
+                        refresh = true;
+                    }
+                    if let Some(toggle) = exclude.toggled {
+                        self.exclude_options.flip(toggle);
+                        refresh = true;
+                    }
                     if exclude.icon_clicked {
                         self.use_preset_excludes = !self.use_preset_excludes;
+                        refresh = true;
                     }
-                    if apply.clicked()
-                        || include.submitted
-                        || exclude.submitted
-                        || exclude.icon_clicked
-                    {
+                    if apply.clicked() || include.submitted || exclude.submitted {
+                        refresh = true;
+                    }
+                    if refresh {
                         self.apply_excludes();
                     }
+                }
+                if !self.pattern_warning.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(&self.pattern_warning)
+                            .small()
+                            .color(egui::Color32::from_rgb(240, 170, 60)),
+                    );
                 }
                 ui.separator();
                 if let Some(ref t) = tree {
@@ -1522,8 +1419,34 @@ impl eframe::App for RsyncStatApp {
                     ui.label("No scan data for this pane.");
                 }
                 ui.separator();
-                ui.heading("Size difference");
+                ui.heading("Information");
+                if let Some(compare) = &self.compare {
+                    ui.label(format!(
+                        "Compare: {} same · {} different size · {} only in A · {} only in B",
+                        compare.same, compare.different, compare.only_a, compare.only_b
+                    ));
+                }
                 if let Some(diff) = &content_diff {
+                    ui.label(space_summary(diff));
+                }
+                if let Some(plan) = &self.preview {
+                    let stale = self.preview_key != self.rules_key();
+                    let stale = if stale { " · preview out of date" } else { "" };
+                    let held = if self.sync_method == SyncMethod::BothWays {
+                        format!(", {} size mismatches left as-is", plan.different)
+                    } else {
+                        String::new()
+                    };
+                    ui.label(format!(
+                        "Plan: {} A→B, {} B→A, {} same{held}, {} excluded{stale}",
+                        plan.a_to_b.len(),
+                        plan.b_to_a.len(),
+                        plan.same,
+                        plan.excluded,
+                    ));
+                }
+                if let Some(diff) = &content_diff {
+                    ui.add_space(4.0);
                     ui::size_diff_view(ui, diff);
                 } else if self.dual_pane && (self.source.scanning || self.target.scanning) {
                     ui.weak("Waiting for both scans to finish.");
@@ -1532,8 +1455,19 @@ impl eframe::App for RsyncStatApp {
                 }
                 ui.separator();
                 ui.heading("File types");
-                if !active_legend.is_empty() {
-                    ui::type_legend(ui, &active_legend);
+                if !type_rows.is_empty() {
+                    let reserve = if space_tiles.is_empty() {
+                        0.0
+                    } else {
+                        4.0 + 20.0 * space_tiles.len() as f32
+                    };
+                    let max_h = (ui.available_height() - reserve).max(36.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("file-types")
+                        .max_height(max_h)
+                        .show(ui, |ui| {
+                            ui::type_legend(ui, &type_rows);
+                        });
                 }
                 if !space_tiles.is_empty() {
                     ui.add_space(4.0);
@@ -1640,23 +1574,20 @@ impl RsyncStatApp {
         show_mnemonic: bool,
         other_hover: &Option<Vec<String>>,
     ) {
-        let title = match pane {
-            ActivePane::Source => "Source (A)",
-            ActivePane::Target => "Target (B)",
-        };
         let scanning = self.pane(pane).scanning;
         ui.set_max_size(size);
         let bounds = ui.max_rect();
         ui.set_clip_rect(ui.clip_rect().intersect(bounds));
-        ui.heading(title);
-        let (choose_id, rescan_id, treemap_id) = match pane {
+        let (choose_id, open_id, rescan_id, treemap_id) = match pane {
             ActivePane::Source => (
                 keyboard::FocusId::PaneAChoose,
+                keyboard::FocusId::OpenSourceA,
                 keyboard::FocusId::PaneARescan,
                 keyboard::FocusId::TreemapA,
             ),
             ActivePane::Target => (
                 keyboard::FocusId::PaneBChoose,
+                keyboard::FocusId::OpenTargetB,
                 keyboard::FocusId::PaneBRescan,
                 keyboard::FocusId::TreemapB,
             ),
@@ -1669,6 +1600,34 @@ impl RsyncStatApp {
                 show_mnemonic,
             );
             self.paint_focus_if(ui, r.rect, choose_id);
+            if r.clicked() {
+                self.pick_folder(ui.ctx(), pane);
+            }
+            let mut path = self
+                .pane(pane)
+                .root
+                .as_ref()
+                .map(|root| root.display().to_string())
+                .unwrap_or_default();
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut path)
+                    .id_source(pane_id.with("folder_path"))
+                    .desired_width(f32::INFINITY)
+                    .interactive(false)
+                    .hint_text("No folder selected"),
+            );
+            if !path.is_empty() {
+                edit.on_hover_text(path);
+            }
+        });
+        ui.horizontal(|ui| {
+            let r = keyboard::mnemonic_button(
+                ui,
+                open_id,
+                keyboard::raw_label_for(open_id),
+                show_mnemonic,
+            );
+            self.paint_focus_if(ui, r.rect, open_id);
             if r.clicked() {
                 self.pick_folder(ui.ctx(), pane);
             }
@@ -1685,19 +1644,16 @@ impl RsyncStatApp {
                     ui.ctx().request_repaint();
                 }
             }
-            if let Some(root) = self.pane(pane).root.as_ref() {
-                let full = root.display().to_string();
-                ui.add(egui::Label::new(&full).truncate())
-                    .on_hover_text(full);
-            }
             if scanning {
                 let pass = self.pane(pane).pass;
                 ui.weak(format!("reading directories · pass {pass}"));
             } else if self.pane(pane).refreshing {
                 ui.weak("refreshing");
             }
-            ui.checkbox(&mut self.pane_mut(pane).show_excluded, "Show excluded")
-                .on_hover_text("Striped tiles for files the filter skipped.");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut self.pane_mut(pane).show_excluded, "Show excluded")
+                    .on_hover_text("Striped tiles for files the filter skipped.");
+            });
         });
         ui.separator();
 

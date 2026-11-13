@@ -4,8 +4,9 @@ use crate::sync::{self, MatchKind};
 use crate::volume::SpaceTile;
 use eframe::egui::{self, Color32, FontId, Mesh, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use egui_ltreeview::{Action, NodeBuilder, RowLayout, TreeView, TreeViewState};
+use rsyncstat_filter::{PatternOptions, PatternToggle};
 use rsyncstat_model::{
-    elide_path_for_width, file_color_rgb, file_type_bucket, readable_color_rgb, TreeNode,
+    elide_path_for_width, file_color_rgb, file_type_id, readable_color_rgb, FileTypeId, TreeNode,
 };
 use rsyncstat_treemap::squarify_indices;
 use std::collections::{HashMap, VecDeque};
@@ -222,24 +223,32 @@ fn tree_row_text(node: &TreeNode) -> String {
     }
 }
 
-pub fn collect_type_sizes(root: &TreeNode) -> HashMap<&'static str, u64> {
+pub fn collect_type_sizes(root: &TreeNode) -> HashMap<FileTypeId, u64> {
     let mut buckets = HashMap::new();
     collect_buckets(root, &mut buckets);
     buckets
 }
 
-pub fn type_legend(ui: &mut egui::Ui, buckets: &HashMap<&'static str, u64>) {
-    let mut items: Vec<_> = buckets
-        .iter()
-        .map(|(name, bytes)| (*name, *bytes))
-        .collect();
-    items.sort_by(|a, b| b.1.cmp(&a.1));
-    for (name, bytes) in items {
+/// Extensions from every pane, sizes added together, largest first.
+pub fn merged_type_rows(legends: &[&HashMap<FileTypeId, u64>]) -> Vec<(FileTypeId, u64)> {
+    let mut merged: HashMap<FileTypeId, u64> = HashMap::new();
+    for legend in legends {
+        for (id, bytes) in *legend {
+            *merged.entry(id.clone()).or_default() += *bytes;
+        }
+    }
+    let mut items: Vec<_> = merged.into_iter().collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.label().cmp(&b.0.label())));
+    items
+}
+
+pub fn type_legend(ui: &mut egui::Ui, rows: &[(FileTypeId, u64)]) {
+    for (id, bytes) in rows {
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::hover());
             ui.painter()
-                .rect_filled(rect, 0.0, color_from_rgb(readable_color_rgb(name)));
-            ui.label(format!("{name}: {}", format_size(bytes)));
+                .rect_filled(rect, 0.0, color_from_rgb(id.color_rgb()));
+            ui.label(format!("{}  {}", id.label(), format_size(*bytes)));
         });
     }
 }
@@ -325,7 +334,7 @@ fn text_width(ui: &egui::Ui, text: &str, font_id: &FontId) -> f32 {
         .x
 }
 
-fn collect_buckets(node: &TreeNode, out: &mut HashMap<&'static str, u64>) {
+fn collect_buckets(node: &TreeNode, out: &mut HashMap<FileTypeId, u64>) {
     if node.is_dir {
         if node.excluded {
             return;
@@ -334,8 +343,8 @@ fn collect_buckets(node: &TreeNode, out: &mut HashMap<&'static str, u64>) {
             collect_buckets(child, out);
         }
     } else {
-        let bucket = file_type_bucket(&node.name);
-        *out.entry(bucket).or_default() += node.size;
+        let id = file_type_id(&node.name);
+        *out.entry(id).or_default() += node.size;
     }
 }
 
@@ -809,14 +818,21 @@ fn track_pointer(
     if interact.hovered() {
         *hover = Some(path.to_vec());
         *space_hover = None;
-        interact
-            .clone()
-            .on_hover_text(hover_tip(rel, node, mark, other_compared));
+        show_tile_tip(&interact, hover_tip(rel, node, mark, other_compared));
     }
     if interact.clicked() {
         *selected = Some(path.to_vec());
     }
     interact.hovered()
+}
+
+fn show_tile_tip(response: &egui::Response, text: impl Into<egui::WidgetText>) {
+    let mut tip = egui::Tooltip::for_enabled(response);
+    tip.popup = tip.popup.align(egui::RectAlign::TOP);
+    tip.show(|ui| {
+        ui.set_max_width(ui.spacing().tooltip_width);
+        ui.label(text);
+    });
 }
 
 fn hover_tip(rel: &str, node: &TreeNode, mark: Option<MatchKind>, other_compared: bool) -> String {
@@ -1147,10 +1163,11 @@ pub enum PatternIcon {
 pub struct PatternEditResult {
     pub submitted: bool,
     pub icon_clicked: bool,
+    pub toggled: Option<PatternToggle>,
     pub rect: Rect,
 }
 
-/// One VS Code-style pattern row: a label, a full-width field, and an icon
+/// One pattern row: a label, a full-width field, match toggles, and an icon
 /// sitting inside the field's right edge.
 pub fn pattern_edit(
     ui: &mut egui::Ui,
@@ -1158,6 +1175,7 @@ pub fn pattern_edit(
     label: &str,
     hint: &str,
     text: &mut String,
+    options: &PatternOptions,
     icon: PatternIcon,
     icon_tip: &str,
 ) -> PatternEditResult {
@@ -1174,11 +1192,18 @@ pub fn pattern_edit(
         StrokeKind::Inside,
     );
 
-    let icon_w = 28.0;
-    let text_rect = Rect::from_min_max(
-        rect.left_top(),
-        Pos2::new(rect.right() - icon_w, rect.bottom()),
+    let icon_w = 26.0;
+    let toggle_w = 24.0;
+    let toggles_w = toggle_w * 3.0;
+    let icon_rect = Rect::from_min_max(
+        Pos2::new(rect.right() - icon_w, rect.top()),
+        rect.right_bottom(),
     );
+    let toggles_rect = Rect::from_min_max(
+        Pos2::new(icon_rect.left() - toggles_w, rect.top()),
+        Pos2::new(icon_rect.left(), rect.bottom()),
+    );
+    let text_rect = Rect::from_min_max(rect.left_top(), Pos2::new(toggles_rect.left(), rect.bottom()));
     let text_response = ui.put(
         text_rect,
         egui::TextEdit::singleline(text)
@@ -1192,10 +1217,13 @@ pub fn pattern_edit(
     let submitted =
         text_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
 
-    let icon_rect = Rect::from_min_max(
-        Pos2::new(rect.right() - icon_w, rect.top()),
-        rect.right_bottom(),
+    let toggled = paint_pattern_toggles(ui, id, toggles_rect, options);
+    ui.painter().vline(
+        icon_rect.left(),
+        icon_rect.y_range().shrink(6.0),
+        Stroke::new(1.0, Color32::from_rgb(90, 90, 90)),
     );
+
     let clickable = matches!(icon, PatternIcon::Gear { .. });
     let icon_response = ui.interact(
         icon_rect,
@@ -1224,8 +1252,81 @@ pub fn pattern_edit(
     PatternEditResult {
         submitted,
         icon_clicked: icon_response.clicked(),
+        toggled,
         rect,
     }
+}
+
+fn paint_pattern_toggles(
+    ui: &mut egui::Ui,
+    id: &str,
+    rect: Rect,
+    options: &PatternOptions,
+) -> Option<PatternToggle> {
+    let buttons = [
+        (PatternToggle::Case, "Aa", false, options.match_case, "Match Case"),
+        (
+            PatternToggle::Word,
+            "ab",
+            true,
+            options.whole_word,
+            "Match Whole Word",
+        ),
+        (
+            PatternToggle::Regex,
+            ".*",
+            false,
+            options.regex,
+            "Use Regular Expression",
+        ),
+    ];
+    let mut toggled = None;
+    let width = rect.width() / buttons.len() as f32;
+    for (index, (kind, label, underline, on, tip)) in buttons.into_iter().enumerate() {
+        let button = Rect::from_min_size(
+            Pos2::new(rect.left() + width * index as f32, rect.top()),
+            Vec2::new(width, rect.height()),
+        );
+        let response = ui.interact(button, ui.scope_id().with((id, label)), Sense::click());
+        let fill = if on {
+            Color32::from_rgb(92, 92, 92)
+        } else if response.hovered() {
+            Color32::from_rgb(74, 74, 74)
+        } else {
+            Color32::TRANSPARENT
+        };
+        if fill != Color32::TRANSPARENT {
+            ui.painter()
+                .rect_filled(button.shrink2(Vec2::new(1.0, 4.0)), 3.0, fill);
+        }
+        let color = if on || response.hovered() {
+            Color32::from_gray(235)
+        } else {
+            Color32::from_gray(150)
+        };
+        let text_rect = ui.painter().text(
+            button.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            FontId::proportional(12.0),
+            color,
+        );
+        if underline {
+            ui.painter().hline(
+                text_rect.x_range(),
+                text_rect.bottom() + 1.0,
+                Stroke::new(1.0, color),
+            );
+        }
+        if response.hovered() {
+            response.clone().on_hover_text(tip);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.clicked() {
+            toggled = Some(kind);
+        }
+    }
+    toggled
 }
 
 fn paint_book(painter: &egui::Painter, rect: Rect, color: Color32) {
@@ -1303,6 +1404,32 @@ mod tests {
         root.children.push(nested);
         root.size = 55;
         root
+    }
+
+    #[test]
+    fn file_types_merge_real_extensions_from_both_trees() {
+        let mut source = TreeNode::new_dir("source");
+        source.children.push(TreeNode::file("photo.PNG", 10));
+        source.children.push(TreeNode::file("notes.txt", 4));
+        let mut target = TreeNode::new_dir("target");
+        target.children.push(TreeNode::file("other.png", 7));
+        target.children.push(TreeNode::file("Makefile", 3));
+        let rows = merged_type_rows(&[
+            &collect_type_sizes(&source),
+            &collect_type_sizes(&target),
+        ]);
+        assert_eq!(
+            rows.iter()
+                .map(|(id, bytes)| (id.label(), *bytes))
+                .collect::<Vec<_>>(),
+            vec![
+                (".png".to_string(), 17),
+                (".txt".to_string(), 4),
+                ("makefile".to_string(), 3),
+            ]
+        );
+        assert_eq!(rows[0].0.color_rgb(), file_color_rgb("photo.png"));
+        assert_eq!(rows[2].0.color_rgb(), file_color_rgb("Makefile"));
     }
 
     fn show_tree(

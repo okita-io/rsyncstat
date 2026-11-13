@@ -15,7 +15,6 @@ pub enum FocusId {
     OpenSourceA,
     OpenTargetB,
     DualPane,
-    MnemonicVisToggle,
     SyncMethod,
     ExcludeTypes,
     ExcludeDirs,
@@ -38,7 +37,6 @@ pub const TAB_ORDER: &[FocusId] = &[
     FocusId::OpenSourceA,
     FocusId::OpenTargetB,
     FocusId::DualPane,
-    FocusId::MnemonicVisToggle,
     FocusId::SyncMethod,
     FocusId::ExcludeTypes,
     FocusId::ExcludeDirs,
@@ -61,7 +59,6 @@ pub const MNEMONIC_LABELS: &[(&'static str, FocusId)] = &[
     ("&Open source (A)…", FocusId::OpenSourceA),
     ("Open &target (B)…", FocusId::OpenTargetB),
     ("&Split view", FocusId::DualPane),
-    ("&Underline keys", FocusId::MnemonicVisToggle),
     ("Sync &mode", FocusId::SyncMethod),
     ("Files to &include", FocusId::ExcludeTypes),
     ("Files to e&xclude", FocusId::ExcludeDirs),
@@ -70,35 +67,16 @@ pub const MNEMONIC_LABELS: &[(&'static str, FocusId)] = &[
     ("Tree &A", FocusId::TreeTabA),
     ("Tree &B", FocusId::TreeTabB),
     ("&Hierarchy", FocusId::DirectoryTree),
-    ("&Choose folder…", FocusId::PaneAChoose),
+    ("Sour&ce…", FocusId::PaneAChoose),
     ("&Rescan", FocusId::PaneARescan),
     ("T&reemap A", FocusId::TreemapA),
     ("S&plitter", FocusId::Splitter),
-    ("&Choose folder…", FocusId::PaneBChoose),
+    ("Tar&get…", FocusId::PaneBChoose),
     ("&Rescan", FocusId::PaneBRescan),
     ("Treemap (&view)", FocusId::TreemapB),
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MnemonicVisibility {
-    Always,
-    WhenAltHeld,
-}
-
-impl Default for MnemonicVisibility {
-    fn default() -> Self {
-        #[cfg(target_os = "linux")]
-        {
-            MnemonicVisibility::Always
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            MnemonicVisibility::WhenAltHeld
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum KeyAction {
     #[default]
@@ -106,7 +84,6 @@ pub enum KeyAction {
     OpenFolder(crate::ActivePane),
     Rescan(crate::ActivePane),
     ToggleDualPane,
-    ToggleMnemonicVis,
     SetActivePane(crate::ActivePane),
     FocusTreeTab(crate::ActivePane),
     TreemapParent(crate::ActivePane),
@@ -123,20 +100,16 @@ pub enum KeyAction {
 #[derive(Clone, Debug)]
 pub struct KeyboardState {
     pub focused: FocusId,
-    pub mnemonic_vis: MnemonicVisibility,
     pub help_open: bool,
     pub pending: KeyAction,
-    last_mnemonic: Option<(char, FocusId)>,
 }
 
 impl Default for KeyboardState {
     fn default() -> Self {
         Self {
             focused: FocusId::OpenSourceA,
-            mnemonic_vis: MnemonicVisibility::default(),
             help_open: false,
             pending: KeyAction::None,
-            last_mnemonic: None,
         }
     }
 }
@@ -276,18 +249,6 @@ fn label_runs(
         }
     }
     runs
-}
-
-pub fn show_mnemonic_underlines(state: &KeyboardState, ctx: &egui::Context) -> bool {
-    match state.mnemonic_vis {
-        MnemonicVisibility::Always => true,
-        MnemonicVisibility::WhenAltHeld => {
-            ctx.input(|i| i.modifiers.alt)
-                || state
-                    .last_mnemonic
-                    .is_some_and(|_| ctx.input(|i| i.modifiers.alt))
-        }
-    }
 }
 
 pub fn paint_focus_ring(ui: &Ui, rect: Rect, focused: bool) {
@@ -444,7 +405,6 @@ pub fn handle_frame_input(
                             if let Some(slot) = focus_for_mnemonic(ch, dual_pane) {
                                 state.focused = slot;
                                 state.pending = KeyAction::ActivateFocused;
-                                state.last_mnemonic = Some((ch.to_ascii_lowercase(), slot));
                             }
                         }
                     }

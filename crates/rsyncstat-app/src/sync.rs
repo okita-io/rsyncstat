@@ -5,7 +5,7 @@
 //! and a different hash is recorded and left in place. Nothing is overwritten.
 //! Two-way sync copies only files that are missing on the other side.
 
-use rsyncstat_filter::FilterSet;
+use rsyncstat_filter::{FilterSet, PatternOptions};
 use rsyncstat_model::TreeNode;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -139,94 +139,21 @@ pub enum SyncEvent {
     Finished(SyncReport),
 }
 
-pub fn rules_from_patterns(include: &str, exclude: &str, use_presets: bool) -> SyncRules {
-    let lines = filter_lines(include, exclude, use_presets);
-    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-    SyncRules {
-        filter: FilterSet::from_user_lines(&borrowed, rsyncstat_filter::RuleLevel::Profile),
-    }
+pub fn rules_from_patterns(
+    include: &str,
+    include_opts: PatternOptions,
+    exclude: &str,
+    exclude_opts: PatternOptions,
+    use_presets: bool,
+) -> SyncRules {
+    let (filter, _) = FilterSet::from_rules(include, include_opts, exclude, exclude_opts, use_presets);
+    SyncRules { filter }
 }
 
 impl SyncRules {
     fn excludes(&self, rel: &str, is_dir: bool) -> bool {
         self.filter.verdict(Path::new(rel), is_dir).excluded
     }
-}
-
-/// Gitignore lines for the scan and the sync plan.
-///
-/// Patterns are comma-separated. `*.log` and `node_modules` exclude those names.
-/// Include patterns are a whitelist: an empty include list keeps every file
-/// that is not excluded. Excludes are applied after includes, so they win.
-pub fn filter_lines(include: &str, exclude: &str, use_presets: bool) -> Vec<String> {
-    let mut lines = Vec::new();
-    if use_presets {
-        lines.extend(
-            rsyncstat_filter::default_preset_rules()
-                .into_iter()
-                .map(str::to_string),
-        );
-    }
-    let includes = split_patterns(include);
-    if !includes.is_empty() {
-        // Drop everything, keep directories walkable, then put the requested
-        // names back. User excludes are appended after this so they still win.
-        lines.push("*".to_string());
-        lines.push("!*/".to_string());
-        for token in includes {
-            lines.extend(include_lines(&token));
-        }
-    }
-    for token in split_patterns(exclude) {
-        if let Some(line) = exclude_line(&token) {
-            lines.push(line);
-        }
-    }
-    lines
-}
-
-fn split_patterns(raw: &str) -> Vec<&str> {
-    raw.split([',', ';', '\n'])
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .collect()
-}
-
-fn safe_pattern(token: &str) -> bool {
-    let token = token.trim().trim_start_matches('!');
-    !token.is_empty()
-        && !token.contains(['\n', '\r', '\0'])
-        && token.split(['/', '\\']).all(|part| part != "..")
-}
-
-fn exclude_line(token: &str) -> Option<String> {
-    let token = token.trim().trim_start_matches('!');
-    if !safe_pattern(token) {
-        return None;
-    }
-    Some(token.to_string())
-}
-
-fn include_lines(token: &str) -> Vec<String> {
-    let token = token.trim().trim_start_matches('!');
-    if !safe_pattern(token) {
-        return Vec::new();
-    }
-    let token = token.trim_end_matches('/');
-    if token.is_empty() {
-        return Vec::new();
-    }
-    // A slash or a wildcard is used as written, anchored the way gitignore anchors it.
-    // A bare name also matches that file or directory in any folder.
-    if token.contains(['*', '?', '/']) {
-        return vec![format!("!{token}"), format!("!{token}/**")];
-    }
-    vec![
-        format!("!{token}"),
-        format!("!{token}/**"),
-        format!("!**/{token}"),
-        format!("!**/{token}/**"),
-    ]
 }
 
 pub fn match_file(rel: &str, size: u64, other: &HashMap<String, u64>) -> Option<MatchKind> {
@@ -830,20 +757,20 @@ mod tests {
 
     #[test]
     fn patterns_become_gitignore_lines() {
-        let lines = filter_lines("*.rs, src/**", "*.log, node_modules", false);
+        let lines = rsyncstat_filter::gitignore_lines("*.rs, src/**", "*.log, node_modules", false);
         assert!(lines.iter().any(|line| line == "*.log"));
         assert!(lines.iter().any(|line| line == "node_modules"));
         assert!(lines.iter().any(|line| line == "*"));
         assert!(lines.iter().any(|line| line == "!*/"));
         assert!(lines.iter().any(|line| line == "!*.rs"));
         assert!(lines.iter().any(|line| line == "!src/**"));
-        assert!(filter_lines("", "../secret", false).is_empty());
+        assert!(rsyncstat_filter::gitignore_lines("", "../secret", false).is_empty());
     }
 
     #[test]
     fn include_patterns_keep_only_matching_files() {
         let (a, b) = sample_trees();
-        let rules = rules_from_patterns("*.txt", "skip", false);
+        let rules = rules_from_patterns("*.txt", PatternOptions::default(), "skip", PatternOptions::default(), false);
         let plan = plan_sync(&a, &b, SyncMethod::AtoB, &rules);
         let mut copied: Vec<_> = plan.a_to_b.iter().map(|op| op.rel.as_str()).collect();
         copied.sort();
@@ -853,7 +780,7 @@ mod tests {
     #[test]
     fn one_way_copies_missing_and_different_sizes() {
         let (a, b) = sample_trees();
-        let rules = rules_from_patterns("", "*.log, *.jpg, skip", false);
+        let rules = rules_from_patterns("", PatternOptions::default(), "*.log, *.jpg, skip", PatternOptions::default(), false);
         let plan = plan_sync(&a, &b, SyncMethod::AtoB, &rules);
         assert_eq!(plan.same, 1);
         assert_eq!(
@@ -870,7 +797,7 @@ mod tests {
     #[test]
     fn two_way_copies_only_missing_files() {
         let (a, b) = sample_trees();
-        let rules = rules_from_patterns("", "*.log, *.jpg, skip", false);
+        let rules = rules_from_patterns("", PatternOptions::default(), "*.log, *.jpg, skip", PatternOptions::default(), false);
         let plan = plan_sync(&a, &b, SyncMethod::BothWays, &rules);
         assert_eq!(plan.different, 1);
         assert_eq!(plan.a_to_b.len(), 1);

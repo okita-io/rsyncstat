@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-pub use file_color::{file_color_rgb, readable_color_rgb};
+pub use file_color::{file_color_rgb, file_type_id, readable_color_rgb, FileTypeId};
 pub use path_display::elide_path_for_width;
 
 /// Stable node identifier for future arena storage.
@@ -211,27 +211,6 @@ fn insert_at(
     );
     add_size(&mut node.children[idx], delta);
     delta
-}
-
-/// Extension → category name for the type legend.
-///
-/// Tile color is separate: each extension is hashed on its own.
-pub fn file_type_bucket(name: &str) -> &'static str {
-    let ext = name.rsplit('.').next().unwrap_or(name);
-    match ext.to_ascii_lowercase().as_str() {
-        "" if name.contains('.') => "no ext",
-        "" => "folders",
-        "rs" | "toml" | "py" | "js" | "ts" | "tsx" | "jsx" | "c" | "cpp" | "h" | "go" | "java" => {
-            "code"
-        }
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "heic" => "images",
-        "mp4" | "mkv" | "mov" | "avi" | "webm" => "video",
-        "mp3" | "flac" | "wav" | "ogg" => "audio",
-        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" => "archives",
-        "pdf" | "doc" | "docx" | "md" | "txt" => "documents",
-        "db" | "sqlite" | "lancedb" => "databases",
-        _ => "other",
-    }
 }
 
 #[cfg(test)]
