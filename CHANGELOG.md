@@ -14,6 +14,7 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 - Community files, issue and PR templates, Dependabot
 
 ### Added (icons)
+- Windows exe icon (build script), macOS `.app` bundling metadata for cargo-bundle, and a tag-triggered release workflow
 - App icon, plus `scripts/make-icons.sh` to build PNG, ICO and ICNS files from one master PNG
 
 ### Changed

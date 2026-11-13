@@ -85,7 +85,21 @@ cd rsyncstat
 cargo run --release -p rsyncstat-app
 ```
 
-The release binary is `target/release/rsyncstat` (`rsyncstat.exe` on Windows). Use **Open folder…** to pick a root.
+The release binary is `target/release/rsyncstat` (`rsyncstat.exe` on Windows, with the app icon embedded). Use **Open folder…** to pick a root.
+
+### macOS app bundle
+
+```bash
+cargo install cargo-bundle --locked
+cargo bundle --release -p rsyncstat-app   # run from the repo root
+open target/release/bundle/osx/RSyncStat.app
+```
+
+This produces `RSyncStat.app` (and a `.dmg`) with the icon. Pushing a `v*` tag builds macOS, Windows and Linux downloads through the Release workflow.
+
+### Icons
+
+Edit `docs/images/icon-original.png`, then run `scripts/make-icons.sh` to regenerate the PNG, ICO and ICNS files.
 
 ## Workspace layout
 
