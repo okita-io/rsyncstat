@@ -97,6 +97,16 @@ open target/release/bundle/osx/RSyncStat.app
 
 This produces `RSyncStat.app` (and a `.dmg`) with the icon. Pushing a `v*` tag builds macOS, Windows and Linux downloads through the Release workflow.
 
+To sign with your Developer ID and notarize, use the helper instead (macOS only):
+
+```bash
+# one time: store notarization credentials in your keychain
+xcrun notarytool store-credentials rsyncstat-notary --apple-id you@example.com --team-id TEAMID
+NOTARY_PROFILE=rsyncstat-notary scripts/bundle-macos.sh   # writes dist/RSyncStat-macos.zip
+```
+
+Without `NOTARY_PROFILE` it signs but skips notarization; `SKIP_SIGN=1` builds the bundle only. The `.dmg` that cargo-bundle also writes is not signed; share the zip.
+
 ### Icons
 
 Edit `docs/images/icon-original.png`, then run `scripts/make-icons.sh` to regenerate the PNG, ICO and ICNS files.
