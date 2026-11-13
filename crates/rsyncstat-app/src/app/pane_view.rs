@@ -55,12 +55,30 @@ impl RsyncStatApp {
                 .as_ref()
                 .map(|root| root.display().to_string())
                 .unwrap_or_default();
-            let edit = ui.add(
+            let colors = ui::FieldColors::for_visuals(ui.visuals());
+            let (field, _) = ui.allocate_exact_size(
+                egui::Vec2::new(ui.available_width(), ui::CONTROL_HEIGHT),
+                egui::Sense::hover(),
+            );
+            ui.painter()
+                .rect_filled(field, f32::from(ui::CONTROL_RADIUS), colors.fill);
+            ui.painter().rect_stroke(
+                field,
+                f32::from(ui::CONTROL_RADIUS),
+                egui::Stroke::new(1.0, colors.border),
+                egui::StrokeKind::Inside,
+            );
+            let edit = ui.put(
+                field,
                 egui::TextEdit::singleline(&mut path)
                     .id_source(pane_id.with("folder_path"))
                     .desired_width(f32::INFINITY)
                     .interactive(false)
-                    .hint_text("No folder selected"),
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::symmetric(8, 4))
+                    .align(egui::Align2::LEFT_CENTER)
+                    .text_color(colors.icon_hover)
+                    .hint_text(egui::RichText::new("No folder selected").color(colors.toggle_text)),
             );
             if !path.is_empty() {
                 edit.on_hover_text(path);

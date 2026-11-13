@@ -66,7 +66,19 @@ impl eframe::App for RsyncStatApp {
             spacing.item_spacing.y = spacing.item_spacing.y.max(pad);
             spacing.button_padding.x = spacing.button_padding.x.max(pad + 2.0);
             spacing.button_padding.y = spacing.button_padding.y.max(pad);
+            // One height for every button, checkbox row and text field.
+            spacing.interact_size.y = ui::CONTROL_HEIGHT;
         }
+        // Menus, dialogs and popups read the context style, not this panel's.
+        ui.ctx().all_styles_mut(|style| {
+            style.spacing.interact_size.y = ui::CONTROL_HEIGHT;
+            let radius = egui::CornerRadius::same(ui::CONTROL_RADIUS);
+            let widgets = &mut style.visuals.widgets;
+            widgets.inactive.corner_radius = radius;
+            widgets.hovered.corner_radius = radius;
+            widgets.active.corner_radius = radius;
+            widgets.open.corner_radius = radius;
+        });
         // egui margins are i8; keep ~5–9 px so focus rings clear panel edges.
         let panel_frame =
             egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(9, 7));

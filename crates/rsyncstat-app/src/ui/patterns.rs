@@ -16,22 +16,27 @@ pub struct PatternEditResult {
     pub text_gained_focus: bool,
 }
 
-/// Colors for the pattern fields, picked to match the active theme.
-struct FieldColors {
-    label: Color32,
-    fill: Color32,
-    border: Color32,
-    divider: Color32,
-    toggle_on: Color32,
-    toggle_hover: Color32,
-    icon: Color32,
-    icon_hover: Color32,
-    toggle_text: Color32,
-    toggle_text_active: Color32,
+/// Height shared by every button, text field and checkbox row.
+pub const CONTROL_HEIGHT: f32 = 30.0;
+/// Corner radius shared by buttons and text fields.
+pub const CONTROL_RADIUS: u8 = 4;
+
+/// Colors for text fields, picked to match the active theme.
+pub struct FieldColors {
+    pub label: Color32,
+    pub fill: Color32,
+    pub border: Color32,
+    pub divider: Color32,
+    pub toggle_on: Color32,
+    pub toggle_hover: Color32,
+    pub icon: Color32,
+    pub icon_hover: Color32,
+    pub toggle_text: Color32,
+    pub toggle_text_active: Color32,
 }
 
 impl FieldColors {
-    fn for_visuals(visuals: &egui::Visuals) -> Self {
+    pub fn for_visuals(visuals: &egui::Visuals) -> Self {
         let g = Color32::from_gray;
         if visuals.dark_mode {
             Self {
@@ -91,11 +96,12 @@ pub fn pattern_edit(
     ui.horizontal(|ui| {
         ui.add_space(inset);
         let width = (ui.available_width() - inset).max(32.0);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::hover());
-        ui.painter().rect_filled(rect, 4.0, colors.fill);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, CONTROL_HEIGHT), Sense::hover());
+        ui.painter()
+            .rect_filled(rect, f32::from(CONTROL_RADIUS), colors.fill);
         ui.painter().rect_stroke(
             rect,
-            4.0,
+            f32::from(CONTROL_RADIUS),
             Stroke::new(1.0, colors.border),
             StrokeKind::Inside,
         );
