@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use sync::{CompareSummary, SyncEvent, SyncMethod, SyncPlan};
+use sync::{CompareSummary, SyncEvent, SyncPlan};
 
 /// Reread the folder that is receiving copies while a sync is running.
 const DEST_REFRESH_EVERY: Duration = Duration::from_secs(3);
@@ -51,14 +51,6 @@ struct ScanStats {
     files: u64,
     excluded_dirs: u64,
     excluded_files: u64,
-}
-
-fn sync_destinations(method: SyncMethod) -> &'static [ActivePane] {
-    match method {
-        SyncMethod::AtoB => &[ActivePane::Target],
-        SyncMethod::BtoA => &[ActivePane::Source],
-        SyncMethod::BothWays => &[ActivePane::Source, ActivePane::Target],
-    }
 }
 
 fn is_copy_temp(rel: &std::path::Path) -> bool {
@@ -192,8 +184,7 @@ impl PaneState {
                 self.stats.files += 1;
                 if entry.excluded {
                     self.stats.excluded_files += 1;
-                }
-                if let Some(name) = entry.rel.file_name() {
+                } else if let Some(name) = entry.rel.file_name() {
                     let name = name.to_string_lossy();
                     *self.legend.entry(file_type_id(&name)).or_default() += entry.size;
                 }
@@ -309,10 +300,14 @@ struct RsyncStatApp {
     filter: Arc<FilterSet>,
     source: PaneState,
     target: PaneState,
-    dual_pane: bool,
     split_fraction: f32,
+    /// Share of the left panel, below the filters, given to the file tree.
+    /// The rest is Information and File types.
+    tree_fraction: f32,
+    /// Share of the area under the file tree given to Information.
+    /// The rest is File types.
+    info_fraction: f32,
     active_pane: ActivePane,
-    sync_method: SyncMethod,
     /// Comma-separated globs. Empty keeps every file that is not excluded.
     files_include: String,
     include_options: PatternOptions,
@@ -332,9 +327,7 @@ struct RsyncStatApp {
     syncing: bool,
     /// Set when the user clicks Stop. Cleared when the copy thread finishes.
     sync_stop_requested: bool,
-    /// Direction captured when the sync started. The combo can change mid-run.
-    syncing_method: SyncMethod,
-    /// When to reread the folder that is receiving copies. `None` while a reread is in flight.
+    /// When to reread the target while it receives copies. `None` while a reread is in flight.
     dest_refresh_at: Option<Instant>,
     sync_status: String,
     /// Tail of the recovery log for the current sync (also written to disk).
@@ -365,16 +358,51 @@ fn pattern_options_key(options: PatternOptions) -> String {
     )
 }
 
+const SECTION_BAR_H: f32 = 8.0;
+
+/// Horizontal drag handle between two stacked sections.
+fn section_split(ui: &mut egui::Ui, tip: &str) -> egui::Response {
+    let (split_rect, split_resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), SECTION_BAR_H),
+        Sense::click_and_drag(),
+    );
+    let stroke_color = if split_resp.dragged() || split_resp.hovered() {
+        egui::Color32::from_rgb(120, 150, 220)
+    } else {
+        egui::Color32::from_gray(80)
+    };
+    ui.painter().hline(
+        split_rect.x_range(),
+        split_rect.center().y,
+        (2.0, stroke_color),
+    );
+    if split_resp.hovered() || split_resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        split_resp.clone().on_hover_text(tip);
+    }
+    split_resp
+}
+
+fn section_height(span: f32, fraction: f32) -> f32 {
+    let min_section = 64.0;
+    let usable = (span - SECTION_BAR_H).max(1.0);
+    if usable <= min_section * 2.0 {
+        usable * 0.5
+    } else {
+        (usable * fraction).clamp(min_section, usable - min_section)
+    }
+}
+
 impl RsyncStatApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             filter: Arc::new(FilterSet::default_presets()),
             source: PaneState::new("Source (A): pick a folder to scan."),
             target: PaneState::new("Target (B): pick a folder to scan."),
-            dual_pane: true,
             split_fraction: 0.5,
+            tree_fraction: 0.45,
+            info_fraction: 0.55,
             active_pane: ActivePane::Source,
-            sync_method: SyncMethod::AtoB,
             files_include: String::new(),
             include_options: PatternOptions::default(),
             files_exclude: String::new(),
@@ -389,9 +417,8 @@ impl RsyncStatApp {
             sync_cancel: None,
             syncing: false,
             sync_stop_requested: false,
-            syncing_method: SyncMethod::AtoB,
             dest_refresh_at: None,
-            sync_status: "Sync copies files. It does not delete extras.".to_string(),
+            sync_status: "Copies files from source to target. It does not delete extras.".to_string(),
             recovery_lines: Vec::new(),
             mismatched_files: Vec::new(),
             folder_pick: None,
@@ -410,7 +437,6 @@ impl RsyncStatApp {
                     self.start_scan(pane, path);
                 }
             }
-            keyboard::KeyAction::ToggleDualPane => self.dual_pane = !self.dual_pane,
             keyboard::KeyAction::SetActivePane(pane) => self.active_pane = pane,
             keyboard::KeyAction::FocusTreeTab(pane) => {
                 self.active_pane = pane;
@@ -464,7 +490,6 @@ impl RsyncStatApp {
         match slot {
             FocusId::OpenSourceA => self.pick_folder(ctx, ActivePane::Source),
             FocusId::OpenTargetB => self.pick_folder(ctx, ActivePane::Target),
-            FocusId::DualPane => self.dual_pane = !self.dual_pane,
             FocusId::ApplyRescan => {
                 if !self.syncing {
                     self.apply_excludes();
@@ -493,8 +518,7 @@ impl RsyncStatApp {
                     self.start_scan(ActivePane::Target, path);
                 }
             }
-            FocusId::SyncMethod
-            | FocusId::ExcludeTypes
+            FocusId::ExcludeTypes
             | FocusId::ExcludeDirs
             | FocusId::DirectoryTree
             | FocusId::TreemapA
@@ -759,11 +783,9 @@ impl RsyncStatApp {
             }
         }
         let mut started = false;
-        for pane in sync_destinations(self.syncing_method) {
-            if self.pane(*pane).root.is_some() && !self.pane(*pane).scanning {
-                self.start_refresh(*pane);
-                started = true;
-            }
+        if self.target.root.is_some() && !self.target.scanning {
+            self.start_refresh(ActivePane::Target);
+            started = true;
         }
         if started {
             self.dest_refresh_at = None;
@@ -799,8 +821,7 @@ impl RsyncStatApp {
 
     fn rules_key(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}|{}",
-            self.sync_method.label(),
+            "{}|{}|{}|{}|{}",
             self.files_include,
             pattern_options_key(self.include_options),
             self.files_exclude,
@@ -828,7 +849,6 @@ impl RsyncStatApp {
             (Some(a), Some(b)) => sync::plan_sync(
                 a,
                 b,
-                self.sync_method,
                 &sync::rules_from_patterns(
                     &self.files_include,
                     self.include_options,
@@ -854,14 +874,22 @@ impl RsyncStatApp {
         );
         self.filter = Arc::new(filter);
         self.pattern_warning = errors.join("\n");
+        self.rescan_open_folders();
+        self.sync_status =
+            "Include and exclude patterns applied. Open folders are scanning again.".to_string();
+    }
+
+    /// Scan every open folder again without changing which tree is on screen.
+    /// A single scan selects its pane, so scanning B last would steal Tree A.
+    fn rescan_open_folders(&mut self) {
+        let viewing = self.active_pane;
         if let Some(path) = self.source.root.clone() {
             self.start_scan(ActivePane::Source, path);
         }
         if let Some(path) = self.target.root.clone() {
             self.start_scan(ActivePane::Target, path);
         }
-        self.sync_status =
-            "Include and exclude patterns applied. Open folders are scanning again.".to_string();
+        self.active_pane = viewing;
     }
 
     fn start_sync(&mut self) {
@@ -891,7 +919,6 @@ impl RsyncStatApp {
         self.sync_cancel = Some(Arc::clone(&cancel));
         self.syncing = true;
         self.sync_stop_requested = false;
-        self.syncing_method = self.sync_method;
         self.dest_refresh_at = Some(Instant::now() + DEST_REFRESH_EVERY);
         self.recovery_lines.clear();
         self.mismatched_files.clear();
@@ -986,12 +1013,7 @@ impl RsyncStatApp {
                         )
                     };
                     if report.copied > 0 {
-                        if let Some(path) = self.source.root.clone() {
-                            self.start_scan(ActivePane::Source, path);
-                        }
-                        if let Some(path) = self.target.root.clone() {
-                            self.start_scan(ActivePane::Target, path);
-                        }
+                        self.rescan_open_folders();
                     }
                     break;
                 }
@@ -1017,7 +1039,7 @@ impl RsyncStatApp {
     }
 
     fn content_diff(&self) -> Option<sync::DirectoryDiff> {
-        if !self.dual_pane || self.source.scanning || self.target.scanning {
+        if self.source.scanning || self.target.scanning {
             return None;
         }
         Some(sync::directory_diff(
@@ -1034,10 +1056,10 @@ impl RsyncStatApp {
         let mut tiles = volume::space_tiles(
             self.pane(pane).volume,
             self.pane(other).volume,
-            self.dual_pane,
+            true,
         );
         let both_drives = self.source.volume.is_some() && self.target.volume.is_some();
-        if self.dual_pane && !both_drives && !self.source.scanning && !self.target.scanning {
+        if !both_drives && !self.source.scanning && !self.target.scanning {
             if let (Some(this), Some(that)) = (
                 self.pane(pane).tree.as_ref(),
                 self.pane(other).tree.as_ref(),
@@ -1060,7 +1082,6 @@ impl eframe::App for RsyncStatApp {
         keyboard::handle_frame_input(
             ctx,
             &mut self.kbd,
-            self.dual_pane,
             has_directory_tree,
             self.active_pane,
             self.source.scanning,
@@ -1091,31 +1112,6 @@ impl eframe::App for RsyncStatApp {
 
         egui::Panel::top("menu").frame(panel_frame).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(keyboard::raw_label_for(keyboard::FocusId::SyncMethod));
-                let combo = egui::ComboBox::from_id_salt("sync_method")
-                    .selected_text(self.sync_method.label());
-                let combo_resp = ui
-                    .push_id(
-                        keyboard::focus_egui_id(keyboard::FocusId::SyncMethod),
-                        |ui| {
-                            combo
-                                .show_ui(ui, |ui| {
-                                    for method in SyncMethod::all() {
-                                        ui.selectable_value(
-                                            &mut self.sync_method,
-                                            method,
-                                            method.label(),
-                                        );
-                                    }
-                                })
-                                .response
-                        },
-                    )
-                    .inner;
-                self.paint_focus_if(ui, combo_resp.rect, keyboard::FocusId::SyncMethod);
-                if combo_resp.clicked() {
-                    self.kbd.focused = keyboard::FocusId::SyncMethod;
-                }
                 let r = if self.syncing {
                     ui.push_id(keyboard::focus_egui_id(keyboard::FocusId::RunSync), |ui| {
                         ui.add_enabled(
@@ -1154,24 +1150,6 @@ impl eframe::App for RsyncStatApp {
                     }
                 }
                 ui.weak(&self.sync_status);
-                ui.separator();
-                let r = keyboard::mnemonic_checkbox(
-                    ui,
-                    keyboard::FocusId::DualPane,
-                    keyboard::raw_label_for(keyboard::FocusId::DualPane),
-                    &mut self.dual_pane,
-                    show_mnemonic,
-                );
-                self.paint_focus_if(ui, r.rect, keyboard::FocusId::DualPane);
-                if r.clicked() {
-                    self.kbd.focused = keyboard::FocusId::DualPane;
-                    if !self.dual_pane {
-                        let order = keyboard::visible_tab_order(false);
-                        if !order.contains(&self.kbd.focused) {
-                            self.kbd.focused = keyboard::FocusId::DualPane;
-                        }
-                    }
-                }
             });
             if !self.mismatched_files.is_empty() {
                 let title = match sync::mismatch_list_path() {
@@ -1230,20 +1208,18 @@ impl eframe::App for RsyncStatApp {
             } else {
                 ui.label(&self.source.idle_status);
             }
-            if self.dual_pane && self.target.scanning {
+            if self.target.scanning {
                 ui::scan_status_line(ui, "B", self.target.current_scan_path.as_ref());
-            } else if self.dual_pane && self.target.refreshing {
+            } else if self.target.refreshing {
                 ui.label(format!("B refreshing · {}", self.target.idle_status));
-            } else if self.dual_pane {
+            } else {
                 ui.label(&self.target.idle_status);
             }
             if let Some(warning) = self.source.warnings.last() {
                 ui.weak(format!("A: {warning}"));
             }
-            if self.dual_pane {
-                if let Some(warning) = self.target.warnings.last() {
-                    ui.weak(format!("B: {warning}"));
-                }
+            if let Some(warning) = self.target.warnings.last() {
+                ui.weak(format!("B: {warning}"));
             }
         });
 
@@ -1262,13 +1238,11 @@ impl eframe::App for RsyncStatApp {
         let active_stats_paths = self.pane(active).stats.paths;
         let active_stats_files = self.pane(active).stats.files;
         let active_started = self.pane(active).started;
-        let type_rows = {
-            let mut legends = vec![&self.source.legend];
-            if self.dual_pane {
-                legends.push(&self.target.legend);
-            }
-            ui::merged_type_rows(&legends)
-        };
+        let type_rows = ui::type_rows_for_view(
+            &self.source.legend,
+            Some(&self.target.legend),
+            active == ActivePane::Target && self.target.root.is_none(),
+        );
         let partner_rel = Self::partner_highlight_rel(match active {
             ActivePane::Source => &target_hover,
             ActivePane::Target => &source_hover,
@@ -1301,22 +1275,20 @@ impl eframe::App for RsyncStatApp {
                         self.active_pane = ActivePane::Source;
                         self.kbd.focused = keyboard::FocusId::TreeTabA;
                     }
-                    if self.dual_pane {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let r = keyboard::mnemonic_selectable(
-                                ui,
-                                keyboard::FocusId::TreeTabB,
-                                keyboard::raw_label_for(keyboard::FocusId::TreeTabB),
-                                active == ActivePane::Target,
-                                show_mnemonic,
-                            );
-                            self.paint_focus_if(ui, r.rect, keyboard::FocusId::TreeTabB);
-                            if r.clicked() {
-                                self.active_pane = ActivePane::Target;
-                                self.kbd.focused = keyboard::FocusId::TreeTabB;
-                            }
-                        });
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let r = keyboard::mnemonic_selectable(
+                            ui,
+                            keyboard::FocusId::TreeTabB,
+                            keyboard::raw_label_for(keyboard::FocusId::TreeTabB),
+                            active == ActivePane::Target,
+                            show_mnemonic,
+                        );
+                        self.paint_focus_if(ui, r.rect, keyboard::FocusId::TreeTabB);
+                        if r.clicked() {
+                            self.active_pane = ActivePane::Target;
+                            self.kbd.focused = keyboard::FocusId::TreeTabB;
+                        }
+                    });
                 });
                 ui.separator();
                 if active_scanning {
@@ -1424,98 +1396,133 @@ impl eframe::App for RsyncStatApp {
                     );
                 }
                 ui.separator();
-                if let Some(ref t) = tree {
-                    let root_path = vec![t.name.clone()];
-                    let (selected, hover) = match active {
-                        ActivePane::Source => {
-                            (&mut self.source.selected_path, &mut self.source.hover_path)
+                let files_top = ui.cursor().min.y;
+                let files_span = ui.available_height();
+                let usable = (files_span - SECTION_BAR_H).max(1.0);
+                let tree_h = section_height(files_span, self.tree_fraction);
+                let (slot, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), tree_h),
+                    Sense::hover(),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(slot), |ui| {
+                    if let Some(ref t) = tree {
+                        let root_path = vec![t.name.clone()];
+                        let (selected, hover) = match active {
+                            ActivePane::Source => (
+                                &mut self.source.selected_path,
+                                &mut self.source.hover_path,
+                            ),
+                            ActivePane::Target => (
+                                &mut self.target.selected_path,
+                                &mut self.target.hover_path,
+                            ),
+                        };
+                        let tree_salt = match active {
+                            ActivePane::Source => "tree-a",
+                            ActivePane::Target => "tree-b",
+                        };
+                        let tree_scroll = ui
+                            .push_id(tree_salt, |ui| {
+                                egui::ScrollArea::both()
+                                    .id_salt("directory-tree")
+                                    .auto_shrink([false, false])
+                                    .max_height(ui.available_height())
+                                    .show(ui, |ui| {
+                                        ui.push_id(
+                                            keyboard::focus_egui_id(
+                                                keyboard::FocusId::DirectoryTree,
+                                            ),
+                                            |ui| {
+                                                ui::tree_view_with_path(
+                                                    ui,
+                                                    t,
+                                                    &root_path,
+                                                    selected,
+                                                    hover,
+                                                    partner_rel.as_deref(),
+                                                    other_ready.then_some(other_files.as_ref()),
+                                                );
+                                            },
+                                        );
+                                    })
+                            })
+                            .inner;
+                        self.paint_focus_if(
+                            ui,
+                            tree_scroll.inner_rect,
+                            keyboard::FocusId::DirectoryTree,
+                        );
+                        if ui.input(|i| {
+                            i.pointer.primary_clicked()
+                                && i.pointer
+                                    .interact_pos()
+                                    .is_some_and(|pos| tree_scroll.inner_rect.contains(pos))
+                        }) {
+                            self.kbd.focused = keyboard::FocusId::DirectoryTree;
                         }
-                        ActivePane::Target => {
-                            (&mut self.target.selected_path, &mut self.target.hover_path)
-                        }
-                    };
-                    let tree_height = (ui.available_height() - 320.0).max(100.0);
-                    let tree_salt = match active {
-                        ActivePane::Source => "tree-a",
-                        ActivePane::Target => "tree-b",
-                    };
-                    let tree_scroll = ui
-                        .push_id(tree_salt, |ui| {
-                            egui::ScrollArea::both()
-                                .id_salt("directory-tree")
-                                .max_height(tree_height)
-                                .show(ui, |ui| {
-                                    ui.push_id(
-                                        keyboard::focus_egui_id(keyboard::FocusId::DirectoryTree),
-                                        |ui| {
-                                            ui::tree_view_with_path(
-                                                ui,
-                                                t,
-                                                &root_path,
-                                                selected,
-                                                hover,
-                                                partner_rel.as_deref(),
-                                                other_ready.then_some(other_files.as_ref()),
-                                            );
-                                        },
-                                    );
-                                })
-                        })
-                        .inner;
-                    self.paint_focus_if(
-                        ui,
-                        tree_scroll.inner_rect,
-                        keyboard::FocusId::DirectoryTree,
-                    );
-                    if ui.input(|i| {
-                        i.pointer.primary_clicked()
-                            && i.pointer
-                                .interact_pos()
-                                .is_some_and(|pos| tree_scroll.inner_rect.contains(pos))
-                    }) {
-                        self.kbd.focused = keyboard::FocusId::DirectoryTree;
-                    }
-                } else if active_scanning {
-                    ui.label("Starting…");
-                } else {
-                    ui.label("No scan data for this pane.");
-                }
-                ui.separator();
-                ui.heading("Information");
-                if let Some(compare) = &self.compare {
-                    ui.label(format!(
-                        "Compare: {} same · {} different size · {} only in A · {} only in B",
-                        compare.same, compare.different, compare.only_a, compare.only_b
-                    ));
-                }
-                if let Some(diff) = &content_diff {
-                    ui.label(space_summary(diff));
-                }
-                if let Some(plan) = &self.preview {
-                    let stale = self.preview_key != self.rules_key();
-                    let stale = if stale { " · preview out of date" } else { "" };
-                    let held = if self.sync_method == SyncMethod::BothWays {
-                        format!(", {} size mismatches left as-is", plan.different)
+                    } else if active_scanning {
+                        ui.label("Starting…");
                     } else {
-                        String::new()
-                    };
-                    ui.label(format!(
-                        "Plan: {} A→B, {} B→A, {} same{held}, {} excluded{stale}",
-                        plan.a_to_b.len(),
-                        plan.b_to_a.len(),
-                        plan.same,
-                        plan.excluded,
-                    ));
+                        ui.label("No scan data for this pane.");
+                    }
+                });
+                let split_resp = section_split(ui, "Drag to resize the file list and information.");
+                if split_resp.dragged() {
+                    if let Some(pos) = split_resp.interact_pointer_pos() {
+                        self.tree_fraction = ((pos.y - files_top) / usable).clamp(0.12, 0.88);
+                    }
                 }
-                if let Some(diff) = &content_diff {
-                    ui.add_space(4.0);
-                    ui::size_diff_view(ui, diff);
-                } else if self.dual_pane && (self.source.scanning || self.target.scanning) {
-                    ui.weak("Waiting for both scans to finish.");
-                } else {
-                    ui.weak("Open two folders to compare their size.");
+                let info_top = ui.cursor().min.y;
+                let info_span = ui.available_height();
+                let info_usable = (info_span - SECTION_BAR_H).max(1.0);
+                let info_h = section_height(info_span, self.info_fraction);
+                let (info_slot, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), info_h),
+                    Sense::hover(),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(info_slot), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("information")
+                        .auto_shrink([false, false])
+                        .max_height(ui.available_height())
+                        .show(ui, |ui| {
+                            ui.heading("Information");
+                            if let Some(compare) = &self.compare {
+                                ui.label(format!(
+                                    "Compare: {} same · {} different size · {} only in A · {} only in B",
+                                    compare.same, compare.different, compare.only_a, compare.only_b
+                                ));
+                            }
+                            if let Some(diff) = &content_diff {
+                                ui.label(space_summary(diff));
+                            }
+                            if let Some(plan) = &self.preview {
+                                let stale = self.preview_key != self.rules_key();
+                                let stale = if stale { " · preview out of date" } else { "" };
+                                ui.label(format!(
+                                    "Plan: {} source → target, {} same size, {} excluded{stale}",
+                                    plan.a_to_b.len(),
+                                    plan.same,
+                                    plan.excluded,
+                                ));
+                            }
+                            if let Some(diff) = &content_diff {
+                                ui.add_space(4.0);
+                                ui::size_diff_view(ui, diff);
+                            } else if self.source.scanning || self.target.scanning {
+                                ui.weak("Waiting for both scans to finish.");
+                            } else {
+                                ui.weak("Open two folders to compare their size.");
+                            }
+                        });
+                });
+                let types_split = section_split(ui, "Drag to resize information and file types.");
+                if types_split.dragged() {
+                    if let Some(pos) = types_split.interact_pointer_pos() {
+                        self.info_fraction =
+                            ((pos.y - info_top) / info_usable).clamp(0.12, 0.88);
+                    }
                 }
-                ui.separator();
                 ui.heading("File types");
                 if !type_rows.is_empty() {
                     let reserve = if space_tiles.is_empty() {
@@ -1540,18 +1547,6 @@ impl eframe::App for RsyncStatApp {
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
-            if !self.dual_pane {
-                self.draw_pane(
-                    ui,
-                    ActivePane::Source,
-                    ui.available_size(),
-                    ui.scope_id().with("solo"),
-                    show_mnemonic,
-                    &target_hover,
-                );
-                return;
-            }
-
             let height = ui.available_height();
             let total_w = ui.available_width();
             let splitter_w = 6.0 + pad;
@@ -1607,7 +1602,10 @@ impl eframe::App for RsyncStatApp {
                     );
                 }
 
-                let right_w = total_w - left_w - splitter_w;
+                // Gaps between the panes and the splitter are not part of
+                // `total_w`. Taking the width still free keeps the target
+                // toolbar inside the window.
+                let right_w = ui.available_width().max(0.0);
                 ui.allocate_ui_with_layout(
                     Vec2::new(right_w, height),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -2002,15 +2000,6 @@ mod tests {
         assert!(pane.scan_rx.is_none());
     }
 
-    #[test]
-    fn sync_destinations_follow_the_copy_direction() {
-        assert_eq!(sync_destinations(SyncMethod::AtoB), &[ActivePane::Target]);
-        assert_eq!(sync_destinations(SyncMethod::BtoA), &[ActivePane::Source]);
-        assert_eq!(
-            sync_destinations(SyncMethod::BothWays),
-            &[ActivePane::Source, ActivePane::Target]
-        );
-    }
 }
 
 /// Run `work` after the current window event has returned.

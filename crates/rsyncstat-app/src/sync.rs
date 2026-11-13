@@ -1,9 +1,8 @@
-//! Compare two scanned trees and copy files between them.
+//! Compare two scanned trees and copy files from source to target.
 //!
-//! One-way sync copies files that are missing on the destination. When the
-//! destination file already exists, the contents are hashed: a match is skipped,
-//! and a different hash is recorded and left in place. Nothing is overwritten.
-//! Two-way sync copies only files that are missing on the other side.
+//! Copies files that are missing on the target. When the target file already
+//! exists, the contents are hashed: a match is skipped, and a different hash
+//! is recorded and left in place. Nothing is overwritten or deleted.
 
 use rsyncstat_filter::{FilterSet, PatternOptions};
 use rsyncstat_model::TreeNode;
@@ -19,27 +18,6 @@ use std::time::Duration;
 const COPY_ATTEMPTS: u32 = 3;
 /// Appended to the destination file name while bytes are copied, then removed on rename.
 pub const COPY_TEMP_SUFFIX: &str = ".rsyncstat-tmp";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SyncMethod {
-    AtoB,
-    BtoA,
-    BothWays,
-}
-
-impl SyncMethod {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::AtoB => "Copy A → B",
-            Self::BtoA => "Copy B → A",
-            Self::BothWays => "Two-way (missing only)",
-        }
-    }
-
-    pub fn all() -> [Self; 3] {
-        [Self::AtoB, Self::BtoA, Self::BothWays]
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatchKind {
@@ -65,7 +43,6 @@ pub struct SyncPlan {
     pub a_to_b: Vec<CopyOp>,
     pub b_to_a: Vec<CopyOp>,
     pub same: u64,
-    pub different: u64,
     pub excluded: u64,
 }
 
@@ -268,9 +245,10 @@ pub fn directory_diff(a: &TreeNode, b: &TreeNode) -> DirectoryDiff {
     }
 }
 
-pub fn plan_sync(a: &TreeNode, b: &TreeNode, method: SyncMethod, rules: &SyncRules) -> SyncPlan {
-    let (files_a, excluded_a) = collect_files(a, rules);
-    let (files_b, excluded_b) = collect_files(b, rules);
+/// Files to copy from source onto target. A file only on the target stays put.
+pub fn plan_sync(source: &TreeNode, target: &TreeNode, rules: &SyncRules) -> SyncPlan {
+    let (files_a, excluded_a) = collect_files(source, rules);
+    let (files_b, excluded_b) = collect_files(target, rules);
     let mut plan = SyncPlan {
         excluded: excluded_a + excluded_b,
         ..SyncPlan::default()
@@ -278,40 +256,13 @@ pub fn plan_sync(a: &TreeNode, b: &TreeNode, method: SyncMethod, rules: &SyncRul
     for (rel, size_a) in &files_a {
         match files_b.get(rel) {
             Some(size_b) if size_b == size_a => plan.same += 1,
-            Some(size_b) => match method {
-                SyncMethod::AtoB => plan.a_to_b.push(CopyOp {
-                    rel: rel.clone(),
-                    bytes: *size_a,
-                }),
-                SyncMethod::BtoA => plan.b_to_a.push(CopyOp {
-                    rel: rel.clone(),
-                    bytes: *size_b,
-                }),
-                SyncMethod::BothWays => plan.different += 1,
-            },
-            None => {
-                if matches!(method, SyncMethod::AtoB | SyncMethod::BothWays) {
-                    plan.a_to_b.push(CopyOp {
-                        rel: rel.clone(),
-                        bytes: *size_a,
-                    });
-                }
-            }
-        }
-    }
-    for (rel, size_b) in &files_b {
-        if files_a.contains_key(rel) {
-            continue;
-        }
-        if matches!(method, SyncMethod::BtoA | SyncMethod::BothWays) {
-            plan.b_to_a.push(CopyOp {
+            Some(_) | None => plan.a_to_b.push(CopyOp {
                 rel: rel.clone(),
-                bytes: *size_b,
-            });
+                bytes: *size_a,
+            }),
         }
     }
     plan.a_to_b.sort_by(|left, right| left.rel.cmp(&right.rel));
-    plan.b_to_a.sort_by(|left, right| left.rel.cmp(&right.rel));
     plan
 }
 
@@ -771,7 +722,7 @@ mod tests {
     fn include_patterns_keep_only_matching_files() {
         let (a, b) = sample_trees();
         let rules = rules_from_patterns("*.txt", PatternOptions::default(), "skip", PatternOptions::default(), false);
-        let plan = plan_sync(&a, &b, SyncMethod::AtoB, &rules);
+        let plan = plan_sync(&a, &b, &rules);
         let mut copied: Vec<_> = plan.a_to_b.iter().map(|op| op.rel.as_str()).collect();
         copied.sort();
         assert_eq!(copied, vec!["diff.txt", "only_a.txt"]);
@@ -781,7 +732,7 @@ mod tests {
     fn one_way_copies_missing_and_different_sizes() {
         let (a, b) = sample_trees();
         let rules = rules_from_patterns("", PatternOptions::default(), "*.log, *.jpg, skip", PatternOptions::default(), false);
-        let plan = plan_sync(&a, &b, SyncMethod::AtoB, &rules);
+        let plan = plan_sync(&a, &b, &rules);
         assert_eq!(plan.same, 1);
         assert_eq!(
             plan.a_to_b
@@ -792,18 +743,6 @@ mod tests {
         );
         assert!(plan.b_to_a.is_empty());
         assert!(plan.excluded >= 3);
-    }
-
-    #[test]
-    fn two_way_copies_only_missing_files() {
-        let (a, b) = sample_trees();
-        let rules = rules_from_patterns("", PatternOptions::default(), "*.log, *.jpg, skip", PatternOptions::default(), false);
-        let plan = plan_sync(&a, &b, SyncMethod::BothWays, &rules);
-        assert_eq!(plan.different, 1);
-        assert_eq!(plan.a_to_b.len(), 1);
-        assert_eq!(plan.a_to_b[0].rel, "only_a.txt");
-        assert_eq!(plan.b_to_a.len(), 1);
-        assert_eq!(plan.b_to_a[0].rel, "only_b.txt");
     }
 
     #[test]

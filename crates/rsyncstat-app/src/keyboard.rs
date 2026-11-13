@@ -8,13 +8,11 @@ use eframe::egui::{
 };
 use std::collections::HashSet;
 
-/// Stable focus targets in tab order (subset may be hidden in single-pane mode).
+/// Stable focus targets in tab order. The directory tree is omitted until a scan exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FocusId {
-    SyncMethod,
     RunSync,
-    DualPane,
     TreeTabA,
     TreeTabB,
     ExcludeTypes,
@@ -33,11 +31,8 @@ pub enum FocusId {
 }
 
 /// Left-to-right, top-to-bottom tab order matching the painted layout.
-/// [`visible_tab_order`] omits pane B when not side-by-side.
 pub const TAB_ORDER: &[FocusId] = &[
-    FocusId::SyncMethod,
     FocusId::RunSync,
-    FocusId::DualPane,
     FocusId::TreeTabA,
     FocusId::TreeTabB,
     FocusId::ExcludeTypes,
@@ -57,11 +52,9 @@ pub const TAB_ORDER: &[FocusId] = &[
 
 /// Toolbar / pane labels with `&` access keys. Kept here so tests can check collisions.
 pub const MNEMONIC_LABELS: &[(&'static str, FocusId)] = &[
-    ("Sync &mode", FocusId::SyncMethod),
     ("Ru&n sync", FocusId::RunSync),
-    ("&Split view", FocusId::DualPane),
-    ("Tree &A", FocusId::TreeTabA),
-    ("Tree &B", FocusId::TreeTabB),
+    ("So&urce", FocusId::TreeTabA),
+    ("T&arget", FocusId::TreeTabB),
     ("Files to &include", FocusId::ExcludeTypes),
     ("Files to e&xclude", FocusId::ExcludeDirs),
     ("Appl&y && rescan", FocusId::ApplyRescan),
@@ -84,7 +77,6 @@ pub enum KeyAction {
     None,
     OpenFolder(crate::ActivePane),
     Rescan(crate::ActivePane),
-    ToggleDualPane,
     SetActivePane(crate::ActivePane),
     FocusTreeTab(crate::ActivePane),
     TreemapParent(crate::ActivePane),
@@ -108,7 +100,7 @@ pub struct KeyboardState {
 impl Default for KeyboardState {
     fn default() -> Self {
         Self {
-            focused: FocusId::SyncMethod,
+            focused: FocusId::RunSync,
             help_open: false,
             pending: KeyAction::None,
         }
@@ -125,34 +117,13 @@ pub fn focus_egui_id(slot: FocusId) -> egui::Id {
     egui::Id::new("rsyncstat_focus").with(u32::from(slot as u8))
 }
 
-pub fn visible_tab_order(dual_pane: bool) -> Vec<FocusId> {
-    visible_tab_order_with(dual_pane, true)
-}
-
 /// Tab targets currently on screen.
 /// `has_directory_tree` is false when the active pane has no scan tree yet.
-pub fn visible_tab_order_with(dual_pane: bool, has_directory_tree: bool) -> Vec<FocusId> {
+pub fn visible_tab_order(has_directory_tree: bool) -> Vec<FocusId> {
     TAB_ORDER
         .iter()
         .copied()
-        .filter(|id| {
-            if !has_directory_tree && matches!(id, FocusId::DirectoryTree) {
-                return false;
-            }
-            if dual_pane {
-                true
-            } else {
-                !matches!(
-                    id,
-                    FocusId::OpenTargetB
-                        | FocusId::PaneBChoose
-                        | FocusId::PaneBRescan
-                        | FocusId::TreemapB
-                        | FocusId::Splitter
-                        | FocusId::TreeTabB
-                )
-            }
-        })
+        .filter(|id| has_directory_tree || !matches!(id, FocusId::DirectoryTree))
         .collect()
 }
 
@@ -302,19 +273,6 @@ pub fn mnemonic_button(
         .inner
 }
 
-pub fn mnemonic_checkbox(
-    ui: &mut Ui,
-    slot: FocusId,
-    raw_label: &str,
-    selected: &mut bool,
-    show_underline: bool,
-) -> Response {
-    let id = focus_egui_id(slot);
-    let parsed = parse_access_label(raw_label);
-    let job = layout_job_for_label(ui, &parsed, show_underline, egui::TextStyle::Body);
-    ui.push_id(id, |ui| ui.checkbox(selected, job)).inner
-}
-
 pub fn mnemonic_selectable(
     ui: &mut Ui,
     slot: FocusId,
@@ -342,16 +300,9 @@ pub fn raw_label_for(slot: FocusId) -> &'static str {
         .expect("every FocusId has a MNEMONIC_LABELS entry")
 }
 
-pub fn focus_for_mnemonic(
-    letter: char,
-    dual_pane: bool,
-    has_directory_tree: bool,
-) -> Option<FocusId> {
+pub fn focus_for_mnemonic(letter: char, has_directory_tree: bool) -> Option<FocusId> {
     let letter = letter.to_ascii_lowercase();
-    let visible: HashSet<FocusId> =
-        visible_tab_order_with(dual_pane, has_directory_tree)
-            .into_iter()
-            .collect();
+    let visible: HashSet<FocusId> = visible_tab_order(has_directory_tree).into_iter().collect();
     MNEMONIC_LABELS
         .iter()
         .filter(|(_, id)| visible.contains(id))
@@ -362,12 +313,9 @@ pub fn focus_for_mnemonic(
 }
 
 /// All access keys that must be unique within a view (per-pane duplicates excluded).
-pub fn toolbar_mnemonic_keys(dual_pane: bool) -> Vec<char> {
+pub fn toolbar_mnemonic_keys() -> Vec<char> {
     let mut keys = Vec::new();
     for (label, id) in MNEMONIC_LABELS {
-        if matches!(id, FocusId::PaneBChoose | FocusId::PaneBRescan) && !dual_pane {
-            continue;
-        }
         if matches!(
             id,
             FocusId::PaneAChoose
@@ -388,7 +336,6 @@ pub fn toolbar_mnemonic_keys(dual_pane: bool) -> Vec<char> {
 pub fn handle_frame_input(
     ctx: &egui::Context,
     state: &mut KeyboardState,
-    dual_pane: bool,
     has_directory_tree: bool,
     active_pane: crate::ActivePane,
     source_scanning: bool,
@@ -396,7 +343,7 @@ pub fn handle_frame_input(
     syncing: bool,
 ) {
     state.pending = KeyAction::None;
-    let order = visible_tab_order_with(dual_pane, has_directory_tree);
+    let order = visible_tab_order(has_directory_tree);
 
     ctx.input_mut(|input| {
         if input.key_pressed(Key::F1)
@@ -420,9 +367,9 @@ pub fn handle_frame_input(
         }
 
         if input.key_pressed(Key::Tab) {
-            // Drop slots that disappeared (single-pane / empty tree) before advancing.
+            // Drop the directory-tree slot when that pane has no scan yet.
             if !order.contains(&state.focused) {
-                state.focused = order.first().copied().unwrap_or(FocusId::SyncMethod);
+                state.focused = order.first().copied().unwrap_or(FocusId::RunSync);
             }
             let idx = order
                 .iter()
@@ -444,7 +391,7 @@ pub fn handle_frame_input(
                     if let Some(ch) = text.chars().next() {
                         if ch.is_ascii_alphabetic() {
                             if let Some(slot) =
-                                focus_for_mnemonic(ch, dual_pane, has_directory_tree)
+                                focus_for_mnemonic(ch, has_directory_tree)
                             {
                                 state.focused = slot;
                                 state.pending = KeyAction::ActivateFocused;
@@ -459,7 +406,7 @@ pub fn handle_frame_input(
         if ctrl && input.key_pressed(Key::Num1) {
             state.focused = FocusId::TreemapA;
             state.pending = KeyAction::SetActivePane(crate::ActivePane::Source);
-        } else if ctrl && input.key_pressed(Key::Num2) && dual_pane {
+        } else if ctrl && input.key_pressed(Key::Num2) {
             state.focused = FocusId::TreemapB;
             state.pending = KeyAction::SetActivePane(crate::ActivePane::Target);
         } else if ctrl && input.key_pressed(Key::O) {
@@ -635,26 +582,11 @@ mod tests {
     }
 
     #[test]
-    fn toolbar_mnemonics_are_unique_single_pane() {
-        let keys = toolbar_mnemonic_keys(false);
+    fn toolbar_mnemonics_are_unique() {
+        let keys = toolbar_mnemonic_keys();
         let mut seen = HashSet::new();
         for k in keys {
-            assert!(
-                seen.insert(k),
-                "duplicate mnemonic '{k}' in single-pane toolbar"
-            );
-        }
-    }
-
-    #[test]
-    fn toolbar_mnemonics_are_unique_dual_pane() {
-        let keys = toolbar_mnemonic_keys(true);
-        let mut seen = HashSet::new();
-        for k in keys {
-            assert!(
-                seen.insert(k),
-                "duplicate mnemonic '{k}' in dual-pane toolbar"
-            );
+            assert!(seen.insert(k), "duplicate mnemonic '{k}'");
         }
     }
 
@@ -663,7 +595,7 @@ mod tests {
         let dual = visible_tab_order(true);
         let sync = dual
             .iter()
-            .position(|&id| id == FocusId::SyncMethod)
+            .position(|&id| id == FocusId::RunSync)
             .unwrap();
         let tree_a = dual.iter().position(|&id| id == FocusId::TreeTabA).unwrap();
         let include = dual
@@ -693,16 +625,13 @@ mod tests {
 
     #[test]
     fn tab_order_starts_with_sync_bar_and_follows_visual_layout() {
-        assert_eq!(TAB_ORDER[0], FocusId::SyncMethod);
-        assert_eq!(TAB_ORDER[1], FocusId::RunSync);
-        assert_eq!(TAB_ORDER[2], FocusId::DualPane);
+        assert_eq!(TAB_ORDER[0], FocusId::RunSync);
+        assert_eq!(TAB_ORDER[1], FocusId::TreeTabA);
         assert!(TAB_ORDER.contains(&FocusId::TreemapA));
         assert!(TAB_ORDER.contains(&FocusId::TreemapB));
-        let single = visible_tab_order(false);
-        assert!(!single.contains(&FocusId::TreemapB));
-        assert!(!single.contains(&FocusId::OpenTargetB));
-        assert!(!single.contains(&FocusId::TreeTabB));
         let dual = visible_tab_order(true);
+        assert!(dual.contains(&FocusId::TreeTabB));
+        assert!(dual.contains(&FocusId::OpenTargetB));
         assert!(
             dual.iter().position(|&a| a == FocusId::TreemapA)
                 < dual.iter().position(|&b| b == FocusId::PaneBChoose)
@@ -726,9 +655,10 @@ mod tests {
 
     #[test]
     fn directory_tree_omitted_from_tab_order_until_scan_exists() {
-        let empty = visible_tab_order_with(false, false);
+        let empty = visible_tab_order(false);
         assert!(!empty.contains(&FocusId::DirectoryTree));
-        let with_tree = visible_tab_order_with(false, true);
+        assert!(empty.contains(&FocusId::TreeTabB));
+        let with_tree = visible_tab_order(true);
         assert!(with_tree.contains(&FocusId::DirectoryTree));
         let include = with_tree
             .iter()

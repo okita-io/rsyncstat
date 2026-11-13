@@ -224,10 +224,29 @@ fn tree_row_text(node: &TreeNode) -> String {
     }
 }
 
+/// Sizes of files the include and exclude rules kept. Excluded files are omitted.
 pub fn collect_type_sizes(root: &TreeNode) -> HashMap<FileTypeId, u64> {
     let mut buckets = HashMap::new();
     collect_buckets(root, &mut buckets);
     buckets
+}
+
+/// File types for the tree on screen. Tree B with no chosen target is empty,
+/// so Tree A's types do not show in that view. Otherwise sizes from the open
+/// panes are added together, largest first.
+pub fn type_rows_for_view(
+    source: &HashMap<FileTypeId, u64>,
+    target: Option<&HashMap<FileTypeId, u64>>,
+    tree_b_without_target: bool,
+) -> Vec<(FileTypeId, u64)> {
+    if tree_b_without_target {
+        return Vec::new();
+    }
+    let mut legends = vec![source];
+    if let Some(target) = target {
+        legends.push(target);
+    }
+    merged_type_rows(&legends)
 }
 
 /// Extensions from every pane, sizes added together, largest first.
@@ -343,7 +362,7 @@ fn collect_buckets(node: &TreeNode, out: &mut HashMap<FileTypeId, u64>) {
         for child in &node.children {
             collect_buckets(child, out);
         }
-    } else {
+    } else if !node.excluded {
         let id = file_type_id(&node.name);
         *out.entry(id).or_default() += node.size;
     }
@@ -1512,6 +1531,25 @@ mod tests {
         );
         assert_eq!(rows[0].0.color_rgb(), file_color_rgb("photo.png"));
         assert_eq!(rows[2].0.color_rgb(), file_color_rgb("Makefile"));
+    }
+
+    #[test]
+    fn file_types_stay_empty_on_tree_b_without_a_target() {
+        let mut source = HashMap::new();
+        source.insert(file_type_id("notes.txt"), 4);
+        assert!(type_rows_for_view(&source, None, true).is_empty());
+        assert_eq!(type_rows_for_view(&source, None, false).len(), 1);
+    }
+
+    #[test]
+    fn file_types_omit_files_the_filter_excluded() {
+        let rows = merged_type_rows(&[&collect_type_sizes(&sample_tree())]);
+        assert_eq!(
+            rows.iter()
+                .map(|(id, bytes)| (id.label(), *bytes))
+                .collect::<Vec<_>>(),
+            vec![(".txt".to_string(), 15)]
+        );
     }
 
     fn show_tree(
