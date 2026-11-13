@@ -12,66 +12,67 @@ use std::collections::HashSet;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FocusId {
-    OpenSourceA,
-    OpenTargetB,
-    DualPane,
     SyncMethod,
+    RunSync,
+    DualPane,
+    TreeTabA,
+    TreeTabB,
     ExcludeTypes,
     ExcludeDirs,
     ApplyRescan,
-    RunSync,
-    TreeTabA,
-    TreeTabB,
     DirectoryTree,
     PaneAChoose,
+    OpenSourceA,
     PaneARescan,
     TreemapA,
     Splitter,
     PaneBChoose,
+    OpenTargetB,
     PaneBRescan,
     TreemapB,
 }
 
-/// Full tab order; [`visible_tab_order`] omits pane B when not side-by-side.
+/// Left-to-right, top-to-bottom tab order matching the painted layout.
+/// [`visible_tab_order`] omits pane B when not side-by-side.
 pub const TAB_ORDER: &[FocusId] = &[
-    FocusId::OpenSourceA,
-    FocusId::OpenTargetB,
-    FocusId::DualPane,
     FocusId::SyncMethod,
+    FocusId::RunSync,
+    FocusId::DualPane,
+    FocusId::TreeTabA,
+    FocusId::TreeTabB,
     FocusId::ExcludeTypes,
     FocusId::ExcludeDirs,
     FocusId::ApplyRescan,
-    FocusId::RunSync,
-    FocusId::TreeTabA,
-    FocusId::TreeTabB,
     FocusId::DirectoryTree,
     FocusId::PaneAChoose,
+    FocusId::OpenSourceA,
     FocusId::PaneARescan,
     FocusId::TreemapA,
     FocusId::Splitter,
     FocusId::PaneBChoose,
+    FocusId::OpenTargetB,
     FocusId::PaneBRescan,
     FocusId::TreemapB,
 ];
 
 /// Toolbar / pane labels with `&` access keys. Kept here so tests can check collisions.
 pub const MNEMONIC_LABELS: &[(&'static str, FocusId)] = &[
-    ("&Open source (A)…", FocusId::OpenSourceA),
-    ("Open &target (B)…", FocusId::OpenTargetB),
-    ("&Split view", FocusId::DualPane),
     ("Sync &mode", FocusId::SyncMethod),
+    ("Ru&n sync", FocusId::RunSync),
+    ("&Split view", FocusId::DualPane),
+    ("Tree &A", FocusId::TreeTabA),
+    ("Tree &B", FocusId::TreeTabB),
     ("Files to &include", FocusId::ExcludeTypes),
     ("Files to e&xclude", FocusId::ExcludeDirs),
     ("Appl&y && rescan", FocusId::ApplyRescan),
-    ("Ru&n sync", FocusId::RunSync),
-    ("Tree &A", FocusId::TreeTabA),
-    ("Tree &B", FocusId::TreeTabB),
     ("&Hierarchy", FocusId::DirectoryTree),
     ("Sour&ce…", FocusId::PaneAChoose),
+    ("&Open source (A)…", FocusId::OpenSourceA),
     ("&Rescan", FocusId::PaneARescan),
     ("T&reemap A", FocusId::TreemapA),
     ("S&plitter", FocusId::Splitter),
     ("Tar&get…", FocusId::PaneBChoose),
+    ("Open &target (B)…", FocusId::OpenTargetB),
     ("&Rescan", FocusId::PaneBRescan),
     ("Treemap (&view)", FocusId::TreemapB),
 ];
@@ -107,11 +108,16 @@ pub struct KeyboardState {
 impl Default for KeyboardState {
     fn default() -> Self {
         Self {
-            focused: FocusId::OpenSourceA,
+            focused: FocusId::SyncMethod,
             help_open: false,
             pending: KeyAction::None,
         }
     }
+}
+
+/// Pattern fields that need egui keyboard focus for typing.
+pub fn is_text_focus(slot: FocusId) -> bool {
+    matches!(slot, FocusId::ExcludeTypes | FocusId::ExcludeDirs)
 }
 
 #[allow(deprecated)]
@@ -120,10 +126,19 @@ pub fn focus_egui_id(slot: FocusId) -> egui::Id {
 }
 
 pub fn visible_tab_order(dual_pane: bool) -> Vec<FocusId> {
+    visible_tab_order_with(dual_pane, true)
+}
+
+/// Tab targets currently on screen.
+/// `has_directory_tree` is false when the active pane has no scan tree yet.
+pub fn visible_tab_order_with(dual_pane: bool, has_directory_tree: bool) -> Vec<FocusId> {
     TAB_ORDER
         .iter()
         .copied()
         .filter(|id| {
+            if !has_directory_tree && matches!(id, FocusId::DirectoryTree) {
+                return false;
+            }
             if dual_pane {
                 true
             } else {
@@ -251,13 +266,27 @@ fn label_runs(
     runs
 }
 
+/// Clearance outside a widget for the focus ring (stroke + corner radius).
+pub const FOCUS_RING_OUTSET: f32 = 4.0;
+
+/// Extra layout padding so rings are not clipped by panel edges or neighbors.
+pub const FOCUS_PAD: f32 = 5.0;
+
 pub fn paint_focus_ring(ui: &Ui, rect: Rect, focused: bool) {
     if !focused {
         return;
     }
     let stroke = Stroke::new(2.0, ui.visuals().selection.stroke.color.gamma_multiply(1.1));
-    ui.painter()
-        .rect_stroke(rect.expand(2.0), 4.0, stroke, StrokeKind::Outside);
+    // Rings are drawn outside the widget; expand the clip so panel edges do not shave them.
+    let painter = ui
+        .painter()
+        .with_clip_rect(ui.clip_rect().expand(FOCUS_RING_OUTSET + FOCUS_PAD));
+    painter.rect_stroke(
+        rect.expand(FOCUS_RING_OUTSET / 2.0),
+        4.0,
+        stroke,
+        StrokeKind::Outside,
+    );
 }
 
 pub fn mnemonic_button(
@@ -313,9 +342,16 @@ pub fn raw_label_for(slot: FocusId) -> &'static str {
         .expect("every FocusId has a MNEMONIC_LABELS entry")
 }
 
-pub fn focus_for_mnemonic(letter: char, dual_pane: bool) -> Option<FocusId> {
+pub fn focus_for_mnemonic(
+    letter: char,
+    dual_pane: bool,
+    has_directory_tree: bool,
+) -> Option<FocusId> {
     let letter = letter.to_ascii_lowercase();
-    let visible: HashSet<FocusId> = visible_tab_order(dual_pane).into_iter().collect();
+    let visible: HashSet<FocusId> =
+        visible_tab_order_with(dual_pane, has_directory_tree)
+            .into_iter()
+            .collect();
     MNEMONIC_LABELS
         .iter()
         .filter(|(_, id)| visible.contains(id))
@@ -353,13 +389,14 @@ pub fn handle_frame_input(
     ctx: &egui::Context,
     state: &mut KeyboardState,
     dual_pane: bool,
+    has_directory_tree: bool,
     active_pane: crate::ActivePane,
     source_scanning: bool,
     target_scanning: bool,
     syncing: bool,
 ) {
     state.pending = KeyAction::None;
-    let order = visible_tab_order(dual_pane);
+    let order = visible_tab_order_with(dual_pane, has_directory_tree);
 
     ctx.input_mut(|input| {
         if input.key_pressed(Key::F1)
@@ -383,6 +420,10 @@ pub fn handle_frame_input(
         }
 
         if input.key_pressed(Key::Tab) {
+            // Drop slots that disappeared (single-pane / empty tree) before advancing.
+            if !order.contains(&state.focused) {
+                state.focused = order.first().copied().unwrap_or(FocusId::SyncMethod);
+            }
             let idx = order
                 .iter()
                 .position(|&id| id == state.focused)
@@ -402,7 +443,9 @@ pub fn handle_frame_input(
                 if let Event::Text(text) = event {
                     if let Some(ch) = text.chars().next() {
                         if ch.is_ascii_alphabetic() {
-                            if let Some(slot) = focus_for_mnemonic(ch, dual_pane) {
+                            if let Some(slot) =
+                                focus_for_mnemonic(ch, dual_pane, has_directory_tree)
+                            {
                                 state.focused = slot;
                                 state.pending = KeyAction::ActivateFocused;
                             }
@@ -442,12 +485,16 @@ pub fn handle_frame_input(
             }
         }
 
-        if state.focused != FocusId::ExcludeTypes && state.focused != FocusId::ExcludeDirs {
+        if !is_text_focus(state.focused) {
             if input.key_pressed(Key::Enter) || input.key_pressed(Key::Space) {
                 state.pending = KeyAction::ActivateFocused;
             }
         }
     });
+
+    // egui's begin_pass already queued Tab/arrow focus moves from the same
+    // key events. Clear that so only our FocusId ring drives Tab order.
+    ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
 }
 
 pub fn take_pending(state: &mut KeyboardState) -> KeyAction {
@@ -612,39 +659,91 @@ mod tests {
     }
 
     #[test]
-    fn focus_order_runs_toolbar_then_pane_a_before_pane_b() {
+    fn focus_order_runs_toolbar_then_left_panel_then_pane_a_before_pane_b() {
         let dual = visible_tab_order(true);
+        let sync = dual
+            .iter()
+            .position(|&id| id == FocusId::SyncMethod)
+            .unwrap();
+        let tree_a = dual.iter().position(|&id| id == FocusId::TreeTabA).unwrap();
+        let include = dual
+            .iter()
+            .position(|&id| id == FocusId::ExcludeTypes)
+            .unwrap();
         let a_choose = dual
             .iter()
             .position(|&id| id == FocusId::PaneAChoose)
+            .unwrap();
+        let a_open = dual
+            .iter()
+            .position(|&id| id == FocusId::OpenSourceA)
             .unwrap();
         let a_map = dual.iter().position(|&id| id == FocusId::TreemapA).unwrap();
         let b_choose = dual
             .iter()
             .position(|&id| id == FocusId::PaneBChoose)
             .unwrap();
-        assert!(a_choose < a_map);
+        assert!(sync < tree_a);
+        assert!(tree_a < include);
+        assert!(include < a_choose);
+        assert!(a_choose < a_open);
+        assert!(a_open < a_map);
         assert!(a_map < b_choose);
-        assert!(
-            dual.iter()
-                .position(|&id| id == FocusId::OpenSourceA)
-                .unwrap()
-                < dual.iter().position(|&id| id == FocusId::TreemapA).unwrap()
-        );
     }
 
     #[test]
-    fn tab_order_starts_with_open_source_and_includes_treemaps() {
-        assert_eq!(TAB_ORDER[0], FocusId::OpenSourceA);
+    fn tab_order_starts_with_sync_bar_and_follows_visual_layout() {
+        assert_eq!(TAB_ORDER[0], FocusId::SyncMethod);
+        assert_eq!(TAB_ORDER[1], FocusId::RunSync);
+        assert_eq!(TAB_ORDER[2], FocusId::DualPane);
         assert!(TAB_ORDER.contains(&FocusId::TreemapA));
         assert!(TAB_ORDER.contains(&FocusId::TreemapB));
         let single = visible_tab_order(false);
         assert!(!single.contains(&FocusId::TreemapB));
+        assert!(!single.contains(&FocusId::OpenTargetB));
+        assert!(!single.contains(&FocusId::TreeTabB));
         let dual = visible_tab_order(true);
         assert!(
             dual.iter().position(|&a| a == FocusId::TreemapA)
                 < dual.iter().position(|&b| b == FocusId::PaneBChoose)
         );
+        // Within a pane: Choose → Open → Rescan → Treemap
+        let a_choose = dual
+            .iter()
+            .position(|&id| id == FocusId::PaneAChoose)
+            .unwrap();
+        let a_open = dual
+            .iter()
+            .position(|&id| id == FocusId::OpenSourceA)
+            .unwrap();
+        let a_rescan = dual
+            .iter()
+            .position(|&id| id == FocusId::PaneARescan)
+            .unwrap();
+        let a_map = dual.iter().position(|&id| id == FocusId::TreemapA).unwrap();
+        assert_eq!((a_choose + 1, a_choose + 2, a_choose + 3), (a_open, a_rescan, a_map));
+    }
+
+    #[test]
+    fn directory_tree_omitted_from_tab_order_until_scan_exists() {
+        let empty = visible_tab_order_with(false, false);
+        assert!(!empty.contains(&FocusId::DirectoryTree));
+        let with_tree = visible_tab_order_with(false, true);
+        assert!(with_tree.contains(&FocusId::DirectoryTree));
+        let include = with_tree
+            .iter()
+            .position(|&id| id == FocusId::ExcludeTypes)
+            .unwrap();
+        let apply = with_tree
+            .iter()
+            .position(|&id| id == FocusId::ApplyRescan)
+            .unwrap();
+        let tree = with_tree
+            .iter()
+            .position(|&id| id == FocusId::DirectoryTree)
+            .unwrap();
+        assert!(include < apply);
+        assert!(apply < tree);
     }
 
     #[test]

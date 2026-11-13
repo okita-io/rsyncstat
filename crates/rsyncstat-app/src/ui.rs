@@ -1165,6 +1165,8 @@ pub struct PatternEditResult {
     pub icon_clicked: bool,
     pub toggled: Option<PatternToggle>,
     pub rect: Rect,
+    /// True when the text field took egui keyboard focus this frame (click or Tab).
+    pub text_gained_focus: bool,
 }
 
 /// One pattern row: a label, a full-width field, match toggles, and an icon
@@ -1178,83 +1180,107 @@ pub fn pattern_edit(
     options: &PatternOptions,
     icon: PatternIcon,
     icon_tip: &str,
+    want_keyboard_focus: bool,
 ) -> PatternEditResult {
     ui.label(egui::RichText::new(label).color(Color32::from_gray(204)));
-    ui.add_space(3.0);
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 4.0, Color32::from_rgb(60, 60, 60));
-    ui.painter().rect_stroke(
-        rect,
-        4.0,
-        Stroke::new(1.0, Color32::from_rgb(78, 78, 78)),
-        StrokeKind::Inside,
-    );
-
-    let icon_w = 26.0;
-    let toggle_w = 24.0;
-    let toggles_w = toggle_w * 3.0;
-    let icon_rect = Rect::from_min_max(
-        Pos2::new(rect.right() - icon_w, rect.top()),
-        rect.right_bottom(),
-    );
-    let toggles_rect = Rect::from_min_max(
-        Pos2::new(icon_rect.left() - toggles_w, rect.top()),
-        Pos2::new(icon_rect.left(), rect.bottom()),
-    );
-    let text_rect = Rect::from_min_max(rect.left_top(), Pos2::new(toggles_rect.left(), rect.bottom()));
-    let text_response = ui.put(
-        text_rect,
-        egui::TextEdit::singleline(text)
-            .id_source(id)
-            .hint_text(hint)
-            .frame(egui::Frame::NONE)
-            .margin(egui::Margin::symmetric(8, 4))
-            .align(egui::Align2::LEFT_CENTER)
-            .desired_width(text_rect.width()),
-    );
-    let submitted =
-        text_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-
-    let toggled = paint_pattern_toggles(ui, id, toggles_rect, options);
-    ui.painter().vline(
-        icon_rect.left(),
-        icon_rect.y_range().shrink(6.0),
-        Stroke::new(1.0, Color32::from_rgb(90, 90, 90)),
-    );
-
-    let clickable = matches!(icon, PatternIcon::Gear { .. });
-    let icon_response = ui.interact(
-        icon_rect,
-        ui.scope_id().with((id, "icon")),
-        if clickable {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    if icon_response.hovered() {
-        icon_response.clone().on_hover_text(icon_tip);
-        if clickable {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-    }
-    let color = if icon_response.hovered() {
-        Color32::from_gray(235)
-    } else {
-        Color32::from_gray(176)
+    ui.add_space(4.0);
+    // Inset the field so the focus ring clears the panel edge.
+    let inset = 4.0;
+    let mut result = PatternEditResult {
+        submitted: false,
+        icon_clicked: false,
+        toggled: None,
+        rect: Rect::NOTHING,
+        text_gained_focus: false,
     };
-    match icon {
-        PatternIcon::Book => paint_book(ui.painter(), icon_rect, color),
-        PatternIcon::Gear { slashed } => paint_gear(ui.painter(), icon_rect, color, slashed),
-    }
-    PatternEditResult {
-        submitted,
-        icon_clicked: icon_response.clicked(),
-        toggled,
-        rect,
-    }
+    ui.horizontal(|ui| {
+        ui.add_space(inset);
+        let width = (ui.available_width() - inset).max(32.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::hover());
+        ui.painter()
+            .rect_filled(rect, 4.0, Color32::from_rgb(60, 60, 60));
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, Color32::from_rgb(78, 78, 78)),
+            StrokeKind::Inside,
+        );
+
+        let icon_w = 26.0;
+        let toggle_w = 24.0;
+        let toggles_w = toggle_w * 3.0;
+        let icon_rect = Rect::from_min_max(
+            Pos2::new(rect.right() - icon_w, rect.top()),
+            rect.right_bottom(),
+        );
+        let toggles_rect = Rect::from_min_max(
+            Pos2::new(icon_rect.left() - toggles_w, rect.top()),
+            Pos2::new(icon_rect.left(), rect.bottom()),
+        );
+        let text_rect =
+            Rect::from_min_max(rect.left_top(), Pos2::new(toggles_rect.left(), rect.bottom()));
+        let text_response = ui.put(
+            text_rect,
+            egui::TextEdit::singleline(text)
+                .id_source(id)
+                .hint_text(hint)
+                .frame(egui::Frame::NONE)
+                .margin(egui::Margin::symmetric(8, 4))
+                .align(egui::Align2::LEFT_CENTER)
+                .desired_width(text_rect.width()),
+        );
+        if want_keyboard_focus {
+            if !text_response.has_focus() {
+                text_response.request_focus();
+            }
+        } else if text_response.has_focus() {
+            text_response.surrender_focus();
+        }
+        let submitted =
+            text_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        let text_gained_focus = text_response.gained_focus() || text_response.clicked();
+
+        let toggled = paint_pattern_toggles(ui, id, toggles_rect, options);
+        ui.painter().vline(
+            icon_rect.left(),
+            icon_rect.y_range().shrink(6.0),
+            Stroke::new(1.0, Color32::from_rgb(90, 90, 90)),
+        );
+
+        let clickable = matches!(icon, PatternIcon::Gear { .. });
+        let icon_response = ui.interact(
+            icon_rect,
+            ui.scope_id().with((id, "icon")),
+            if clickable {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        if icon_response.hovered() {
+            icon_response.clone().on_hover_text(icon_tip);
+            if clickable {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+        let color = if icon_response.hovered() {
+            Color32::from_gray(235)
+        } else {
+            Color32::from_gray(176)
+        };
+        match icon {
+            PatternIcon::Book => paint_book(ui.painter(), icon_rect, color),
+            PatternIcon::Gear { slashed } => paint_gear(ui.painter(), icon_rect, color, slashed),
+        }
+        result = PatternEditResult {
+            submitted,
+            icon_clicked: icon_response.clicked(),
+            toggled,
+            rect,
+            text_gained_focus,
+        };
+    });
+    result
 }
 
 fn paint_pattern_toggles(

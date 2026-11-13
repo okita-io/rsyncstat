@@ -1045,10 +1045,12 @@ impl eframe::App for RsyncStatApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_folder_pick(ctx);
         self.poll_scans(ctx);
+        let has_directory_tree = self.pane(self.active_pane).tree.is_some();
         keyboard::handle_frame_input(
             ctx,
             &mut self.kbd,
             self.dual_pane,
+            has_directory_tree,
             self.active_pane,
             self.source.scanning,
             self.target.scanning,
@@ -1062,7 +1064,21 @@ impl eframe::App for RsyncStatApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let content_diff = self.content_diff();
         let show_mnemonic = true;
-        egui::Panel::top("menu").show(ui, |ui| {
+        let pad = keyboard::FOCUS_PAD;
+        {
+            let spacing = ui.spacing_mut();
+            spacing.item_spacing.x = spacing.item_spacing.x.max(pad);
+            spacing.item_spacing.y = spacing.item_spacing.y.max(pad);
+            spacing.button_padding.x = spacing.button_padding.x.max(pad + 2.0);
+            spacing.button_padding.y = spacing.button_padding.y.max(pad);
+        }
+        // egui margins are i8; keep ~5–9 px so focus rings clear panel edges.
+        let panel_frame = egui::Frame::side_top_panel(ui.style())
+            .inner_margin(egui::Margin::symmetric(9, 7));
+        let central_frame = egui::Frame::central_panel(ui.style())
+            .inner_margin(egui::Margin::same(8));
+
+        egui::Panel::top("menu").frame(panel_frame).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(keyboard::raw_label_for(keyboard::FocusId::SyncMethod));
                 let combo = egui::ComboBox::from_id_salt("sync_method")
@@ -1086,6 +1102,9 @@ impl eframe::App for RsyncStatApp {
                     )
                     .inner;
                 self.paint_focus_if(ui, combo_resp.rect, keyboard::FocusId::SyncMethod);
+                if combo_resp.clicked() {
+                    self.kbd.focused = keyboard::FocusId::SyncMethod;
+                }
                 let r = if self.syncing {
                     ui.push_id(keyboard::focus_egui_id(keyboard::FocusId::RunSync), |ui| {
                         ui.add_enabled(
@@ -1116,6 +1135,7 @@ impl eframe::App for RsyncStatApp {
                 };
                 self.paint_focus_if(ui, r.rect, keyboard::FocusId::RunSync);
                 if r.clicked() {
+                    self.kbd.focused = keyboard::FocusId::RunSync;
                     if self.syncing {
                         self.stop_sync();
                     } else {
@@ -1132,6 +1152,15 @@ impl eframe::App for RsyncStatApp {
                     show_mnemonic,
                 );
                 self.paint_focus_if(ui, r.rect, keyboard::FocusId::DualPane);
+                if r.clicked() {
+                    self.kbd.focused = keyboard::FocusId::DualPane;
+                    if !self.dual_pane {
+                        let order = keyboard::visible_tab_order(false);
+                        if !order.contains(&self.kbd.focused) {
+                            self.kbd.focused = keyboard::FocusId::DualPane;
+                        }
+                    }
+                }
             });
             if !self.mismatched_files.is_empty() {
                 let title = match sync::mismatch_list_path() {
@@ -1180,7 +1209,9 @@ impl eframe::App for RsyncStatApp {
             }
         });
 
-        egui::Panel::bottom("status").show(ui, |ui| {
+        egui::Panel::bottom("status")
+            .frame(panel_frame)
+            .show(ui, |ui| {
             if self.source.scanning {
                 ui::scan_status_line(ui, "A", self.source.current_scan_path.as_ref());
             } else if self.source.refreshing {
@@ -1244,6 +1275,7 @@ impl eframe::App for RsyncStatApp {
         egui::Panel::left("tree_panel")
             .resizable(true)
             .default_size(280.0)
+            .frame(panel_frame)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let r = keyboard::mnemonic_selectable(
@@ -1289,7 +1321,7 @@ impl eframe::App for RsyncStatApp {
                     );
                     ui.separator();
                 }
-                ui.add_space(2.0);
+                ui.add_space(pad);
                 let include = ui::pattern_edit(
                     ui,
                     "files-include",
@@ -1299,9 +1331,13 @@ impl eframe::App for RsyncStatApp {
                     &self.include_options,
                     ui::PatternIcon::Book,
                     "Comma-separated patterns. Empty includes every file that is not excluded. Aa matches case, ab matches a whole word, .* is a regular expression.",
+                    keyboard::is_focused(&self.kbd, keyboard::FocusId::ExcludeTypes),
                 );
                 self.paint_focus_if(ui, include.rect, keyboard::FocusId::ExcludeTypes);
-                ui.add_space(8.0);
+                if include.text_gained_focus {
+                    self.kbd.focused = keyboard::FocusId::ExcludeTypes;
+                }
+                ui.add_space(pad + 4.0);
                 let gear_tip = if self.use_preset_excludes {
                     "Built-in excludes are on (.DS_Store, node_modules, target, …). Click to turn them off."
                 } else {
@@ -1318,9 +1354,13 @@ impl eframe::App for RsyncStatApp {
                         slashed: !self.use_preset_excludes,
                     },
                     gear_tip,
+                    keyboard::is_focused(&self.kbd, keyboard::FocusId::ExcludeDirs),
                 );
                 self.paint_focus_if(ui, exclude.rect, keyboard::FocusId::ExcludeDirs);
-                ui.add_space(6.0);
+                if exclude.text_gained_focus {
+                    self.kbd.focused = keyboard::FocusId::ExcludeDirs;
+                }
+                ui.add_space(pad + 2.0);
                 let apply = ui
                     .push_id(
                         keyboard::focus_egui_id(keyboard::FocusId::ApplyRescan),
@@ -1340,6 +1380,9 @@ impl eframe::App for RsyncStatApp {
                     )
                     .inner;
                 self.paint_focus_if(ui, apply.rect, keyboard::FocusId::ApplyRescan);
+                if apply.clicked() {
+                    self.kbd.focused = keyboard::FocusId::ApplyRescan;
+                }
                 if !self.syncing {
                     let mut refresh = false;
                     if let Some(toggle) = include.toggled {
@@ -1413,6 +1456,14 @@ impl eframe::App for RsyncStatApp {
                         tree_scroll.inner_rect,
                         keyboard::FocusId::DirectoryTree,
                     );
+                    if ui.input(|i| {
+                        i.pointer.primary_clicked()
+                            && i.pointer
+                                .interact_pos()
+                                .is_some_and(|pos| tree_scroll.inner_rect.contains(pos))
+                    }) {
+                        self.kbd.focused = keyboard::FocusId::DirectoryTree;
+                    }
                 } else if active_scanning {
                     ui.label("Starting…");
                 } else {
@@ -1475,7 +1526,9 @@ impl eframe::App for RsyncStatApp {
                 }
             });
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        egui::CentralPanel::default()
+            .frame(central_frame)
+            .show(ui, |ui| {
             if !self.dual_pane {
                 self.draw_pane(
                     ui,
@@ -1490,11 +1543,11 @@ impl eframe::App for RsyncStatApp {
 
             let height = ui.available_height();
             let total_w = ui.available_width();
-            let splitter_w = 6.0;
+            let splitter_w = 6.0 + pad;
             let left_w = (total_w - splitter_w) * self.split_fraction.clamp(0.15, 0.85);
 
             ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.spacing_mut().item_spacing.x = pad;
                 ui.allocate_ui_with_layout(
                     Vec2::new(left_w, height),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -1530,6 +1583,9 @@ impl eframe::App for RsyncStatApp {
                     }
                 }
                 self.paint_focus_if(ui, split_rect, keyboard::FocusId::Splitter);
+                if split_resp.clicked() || split_resp.drag_started() {
+                    self.kbd.focused = keyboard::FocusId::Splitter;
+                }
                 if keyboard::is_focused(&self.kbd, keyboard::FocusId::Splitter) {
                     let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(150, 200, 255));
                     ui.painter().rect_stroke(
@@ -1575,9 +1631,12 @@ impl RsyncStatApp {
         other_hover: &Option<Vec<String>>,
     ) {
         let scanning = self.pane(pane).scanning;
+        let pad = keyboard::FOCUS_PAD;
         ui.set_max_size(size);
         let bounds = ui.max_rect();
-        ui.set_clip_rect(ui.clip_rect().intersect(bounds));
+        // Leave room for focus rings around toolbar buttons at the pane edge.
+        ui.set_clip_rect(ui.clip_rect().intersect(bounds).expand(keyboard::FOCUS_RING_OUTSET));
+        ui.add_space(pad);
         let (choose_id, open_id, rescan_id, treemap_id) = match pane {
             ActivePane::Source => (
                 keyboard::FocusId::PaneAChoose,
@@ -1601,6 +1660,7 @@ impl RsyncStatApp {
             );
             self.paint_focus_if(ui, r.rect, choose_id);
             if r.clicked() {
+                self.kbd.focused = choose_id;
                 self.pick_folder(ui.ctx(), pane);
             }
             let mut path = self
@@ -1629,6 +1689,7 @@ impl RsyncStatApp {
             );
             self.paint_focus_if(ui, r.rect, open_id);
             if r.clicked() {
+                self.kbd.focused = open_id;
                 self.pick_folder(ui.ctx(), pane);
             }
             let r = keyboard::mnemonic_button(
@@ -1639,6 +1700,7 @@ impl RsyncStatApp {
             );
             self.paint_focus_if(ui, r.rect, rescan_id);
             if r.clicked() {
+                self.kbd.focused = rescan_id;
                 if let Some(path) = self.pane(pane).root.clone() {
                     self.start_scan(pane, path);
                     ui.ctx().request_repaint();
@@ -1694,14 +1756,25 @@ impl RsyncStatApp {
                 let treemap_focused = keyboard::is_focused(&self.kbd, treemap_id);
                 // Do not allocate this rect: treemap_view paints into the same
                 // space. Allocating it first left the map with no room and a
-                // blank (near-black) panel.
-                let map_rect = ui.available_rect_before_wrap();
+                // blank (near-black) panel. Inset so the focus ring clears the
+                // pane edge and neighboring toolbar.
+                let map_rect = ui
+                    .available_rect_before_wrap()
+                    .shrink(keyboard::FOCUS_PAD);
                 let map_focus = keyboard::focus_region_at(
                     ui,
                     treemap_id,
                     map_rect,
                     egui::Sense::focusable_noninteractive(),
                 );
+                if ui.input(|i| {
+                    i.pointer.primary_clicked()
+                        && i.pointer
+                            .interact_pos()
+                            .is_some_and(|pos| map_rect.contains(pos))
+                }) {
+                    self.kbd.focused = treemap_id;
+                }
                 keyboard::paint_focus_ring(ui, map_focus.rect, treemap_focused);
                 let ctx = ui::TreemapCtx {
                     selected,
