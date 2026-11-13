@@ -51,7 +51,7 @@ pub const TAB_ORDER: &[FocusId] = &[
 ];
 
 /// Toolbar / pane labels with `&` access keys. Kept here so tests can check collisions.
-pub const MNEMONIC_LABELS: &[(&'static str, FocusId)] = &[
+pub const MNEMONIC_LABELS: &[(&str, FocusId)] = &[
     ("Ru&n sync", FocusId::RunSync),
     ("So&urce", FocusId::TreeTabA),
     ("T&arget", FocusId::TreeTabB),
@@ -75,16 +75,16 @@ pub const MNEMONIC_LABELS: &[(&'static str, FocusId)] = &[
 pub enum KeyAction {
     #[default]
     None,
-    OpenFolder(crate::ActivePane),
-    Rescan(crate::ActivePane),
-    SetActivePane(crate::ActivePane),
-    FocusTreeTab(crate::ActivePane),
-    TreemapParent(crate::ActivePane),
-    TreemapChild(crate::ActivePane),
+    OpenFolder(crate::app::ActivePane),
+    Rescan(crate::app::ActivePane),
+    SetActivePane(crate::app::ActivePane),
+    FocusTreeTab(crate::app::ActivePane),
+    TreemapParent(crate::app::ActivePane),
+    TreemapChild(crate::app::ActivePane),
     RefreshCompare,
     StartSync,
     ApplyExcludes,
-    CancelScan(crate::ActivePane),
+    CancelScan(crate::app::ActivePane),
     CancelSync,
     ActivateFocused,
     ToggleHelp,
@@ -313,6 +313,7 @@ pub fn focus_for_mnemonic(letter: char, has_directory_tree: bool) -> Option<Focu
 }
 
 /// All access keys that must be unique within a view (per-pane duplicates excluded).
+#[cfg(test)]
 pub fn toolbar_mnemonic_keys() -> Vec<char> {
     let mut keys = Vec::new();
     for (label, id) in MNEMONIC_LABELS {
@@ -337,7 +338,7 @@ pub fn handle_frame_input(
     ctx: &egui::Context,
     state: &mut KeyboardState,
     has_directory_tree: bool,
-    active_pane: crate::ActivePane,
+    active_pane: crate::app::ActivePane,
     source_scanning: bool,
     target_scanning: bool,
     syncing: bool,
@@ -359,9 +360,9 @@ pub fn handle_frame_input(
             } else if syncing {
                 state.pending = KeyAction::CancelSync;
             } else if source_scanning {
-                state.pending = KeyAction::CancelScan(crate::ActivePane::Source);
+                state.pending = KeyAction::CancelScan(crate::app::ActivePane::Source);
             } else if target_scanning {
-                state.pending = KeyAction::CancelScan(crate::ActivePane::Target);
+                state.pending = KeyAction::CancelScan(crate::app::ActivePane::Target);
             }
             input.consume_key(Modifiers::NONE, Key::Escape);
         }
@@ -384,15 +385,12 @@ pub fn handle_frame_input(
             input.consume_key(input.modifiers, Key::Tab);
         }
 
-        if input.modifiers.alt && input.modifiers.ctrl == false && input.modifiers.mac_cmd == false
-        {
+        if input.modifiers.alt && !input.modifiers.ctrl && !input.modifiers.mac_cmd {
             for event in &input.events {
                 if let Event::Text(text) = event {
                     if let Some(ch) = text.chars().next() {
                         if ch.is_ascii_alphabetic() {
-                            if let Some(slot) =
-                                focus_for_mnemonic(ch, has_directory_tree)
-                            {
+                            if let Some(slot) = focus_for_mnemonic(ch, has_directory_tree) {
                                 state.focused = slot;
                                 state.pending = KeyAction::ActivateFocused;
                             }
@@ -405,10 +403,10 @@ pub fn handle_frame_input(
         let ctrl = input.modifiers.ctrl || input.modifiers.mac_cmd;
         if ctrl && input.key_pressed(Key::Num1) {
             state.focused = FocusId::TreemapA;
-            state.pending = KeyAction::SetActivePane(crate::ActivePane::Source);
+            state.pending = KeyAction::SetActivePane(crate::app::ActivePane::Source);
         } else if ctrl && input.key_pressed(Key::Num2) {
             state.focused = FocusId::TreemapB;
-            state.pending = KeyAction::SetActivePane(crate::ActivePane::Target);
+            state.pending = KeyAction::SetActivePane(crate::app::ActivePane::Target);
         } else if ctrl && input.key_pressed(Key::O) {
             state.pending = KeyAction::OpenFolder(active_pane);
         } else if ctrl && input.key_pressed(Key::R) || input.key_pressed(Key::F5) {
@@ -418,9 +416,9 @@ pub fn handle_frame_input(
         }
 
         let treemap_pane = if state.focused == FocusId::TreemapA {
-            Some(crate::ActivePane::Source)
+            Some(crate::app::ActivePane::Source)
         } else if state.focused == FocusId::TreemapB {
-            Some(crate::ActivePane::Target)
+            Some(crate::app::ActivePane::Target)
         } else {
             None
         };
@@ -432,10 +430,10 @@ pub fn handle_frame_input(
             }
         }
 
-        if !is_text_focus(state.focused) {
-            if input.key_pressed(Key::Enter) || input.key_pressed(Key::Space) {
-                state.pending = KeyAction::ActivateFocused;
-            }
+        if !is_text_focus(state.focused)
+            && (input.key_pressed(Key::Enter) || input.key_pressed(Key::Space))
+        {
+            state.pending = KeyAction::ActivateFocused;
         }
     });
 
@@ -517,7 +515,7 @@ pub fn treemap_nav_child(root: &rsyncstat_model::TreeNode, selected: &mut Option
             return;
         }
     };
-    let Some(node) = crate::find_by_path(root, &path) else {
+    let Some(node) = root.find_by_path(&path) else {
         return;
     };
     if !node.is_dir || node.excluded {
@@ -593,10 +591,7 @@ mod tests {
     #[test]
     fn focus_order_runs_toolbar_then_left_panel_then_pane_a_before_pane_b() {
         let dual = visible_tab_order(true);
-        let sync = dual
-            .iter()
-            .position(|&id| id == FocusId::RunSync)
-            .unwrap();
+        let sync = dual.iter().position(|&id| id == FocusId::RunSync).unwrap();
         let tree_a = dual.iter().position(|&id| id == FocusId::TreeTabA).unwrap();
         let include = dual
             .iter()
@@ -650,7 +645,10 @@ mod tests {
             .position(|&id| id == FocusId::PaneARescan)
             .unwrap();
         let a_map = dual.iter().position(|&id| id == FocusId::TreemapA).unwrap();
-        assert_eq!((a_choose + 1, a_choose + 2, a_choose + 3), (a_open, a_rescan, a_map));
+        assert_eq!(
+            (a_choose + 1, a_choose + 2, a_choose + 3),
+            (a_open, a_rescan, a_map)
+        );
     }
 
     #[test]

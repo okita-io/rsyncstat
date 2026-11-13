@@ -16,11 +16,12 @@ path = "src/main.rs"
 rsyncstat-model = { path = "../rsyncstat-model" }
 rsyncstat-filter = { path = "../rsyncstat-filter" }
 rsyncstat-scan = { path = "../rsyncstat-scan" }
+rsyncstat-plan = { path = "../rsyncstat-plan" }
+rsyncstat-exec = { path = "../rsyncstat-exec" }
 rsyncstat-treemap = { path = "../rsyncstat-treemap" }
 eframe.workspace = true
 rfd.workspace = true
 crossbeam-channel.workspace = true
-blake3.workspace = true
 trash.workspace = true
 egui_ltreeview = "0.10.0"
 
