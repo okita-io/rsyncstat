@@ -27,6 +27,19 @@ pub struct PatternEditResult {
 pub const CONTROL_HEIGHT: f32 = 30.0;
 /// Corner radius shared by buttons and text fields.
 pub const CONTROL_RADIUS: u8 = 4;
+/// Inner padding for custom-painted text fields. Left is larger so glyphs
+/// do not sit on the stroke. Used on the frame because `.margin()` is ignored
+/// when `Frame::NONE` is set.
+pub const FIELD_TEXT_MARGIN: egui::Margin = egui::Margin {
+    left: 12,
+    right: 8,
+    top: 4,
+    bottom: 4,
+};
+
+pub fn field_text_frame() -> egui::Frame {
+    egui::Frame::NONE.inner_margin(FIELD_TEXT_MARGIN)
+}
 
 /// Colors for text fields, picked to match the active theme.
 pub struct FieldColors {
@@ -135,8 +148,7 @@ pub fn pattern_edit(
                 .id_source(id)
                 .hint_text(egui::RichText::new(hint).color(colors.toggle_text))
                 .text_color(colors.icon_hover)
-                .frame(egui::Frame::NONE)
-                .margin(egui::Margin::symmetric(8, 4))
+                .frame(field_text_frame())
                 .align(egui::Align2::LEFT_CENTER)
                 .desired_width(text_rect.width()),
         );

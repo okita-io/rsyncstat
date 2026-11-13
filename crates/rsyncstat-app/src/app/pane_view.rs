@@ -74,8 +74,7 @@ impl RsyncStatApp {
                     .id_source(pane_id.with("folder_path"))
                     .desired_width(f32::INFINITY)
                     .interactive(false)
-                    .frame(egui::Frame::NONE)
-                    .margin(egui::Margin::symmetric(8, 4))
+                    .frame(ui::field_text_frame())
                     .align(egui::Align2::LEFT_CENTER)
                     .text_color(colors.icon_hover)
                     .hint_text(egui::RichText::new("No folder selected").color(colors.toggle_text)),
