@@ -5,7 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sync executor (stub)"
+description = "Sync executor: copies planned files safely"
 
 [dependencies]
 rsyncstat-plan = { path = "../rsyncstat-plan" }
+rsyncstat-scan = { path = "../rsyncstat-scan" }
+blake3.workspace = true
+crossbeam-channel.workspace = true
+
+[dev-dependencies]
+rsyncstat-filter = { path = "../rsyncstat-filter" }
+rsyncstat-model = { path = "../rsyncstat-model" }

@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sync plan builder (stub)"
+description = "Sync plan builder: compare scanned trees and decide which files to copy"
 
 [dependencies]
+rsyncstat-filter = { path = "../rsyncstat-filter" }
 rsyncstat-model = { path = "../rsyncstat-model" }
