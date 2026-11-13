@@ -892,9 +892,9 @@ struct DitherGlows {
 
 /// Each box shades from its own color at the top edge to 30% darker at the
 /// bottom edge. The fade is a pixel-aligned Bayer stipple, so neighboring
-/// boxes do not share one smooth gradient. A match outline is a solid line
-/// on that grid, and a hover fills an even quarter of the cells with the
-/// same green.
+/// boxes do not share one smooth gradient. A match outline is a solid frame
+/// one map pixel thick, and a hover fills an even quarter of the cells with
+/// the same green.
 fn paint_tile_gradient(
     painter: &egui::Painter,
     grid: &MapGrid,
@@ -918,8 +918,17 @@ fn paint_dither(
     fill: Option<Color32>,
     glows: &DitherGlows,
 ) {
-    if let Some(mesh) = dither_mesh(rect, grid, fill, glows) {
+    let cells = DitherGlows {
+        outline: None,
+        hover: glows.hover,
+    };
+    if let Some(mesh) = dither_mesh(rect, grid, fill, &cells) {
         painter.add(mesh);
+    }
+    if let Some(color) = glows.outline {
+        for bar in outline_frame(rect, grid) {
+            painter.rect_filled(bar, 0.0, color);
+        }
     }
 }
 
@@ -941,7 +950,6 @@ fn dither_mesh(
     if right <= left || bottom <= top {
         return None;
     }
-    let width = (right - left) as f32;
     let height = (bottom - top) as f32;
     let mut mesh = Mesh::default();
     let mut x = left - (left - grid.origin_x).rem_euclid(cell);
@@ -962,10 +970,6 @@ fn dither_mesh(
             } else {
                 ((vis_y0 + vis_y1) as f32 * 0.5 - top as f32) / height
             };
-            let lx0 = (vis_x0 - left) as f32;
-            let ly0 = (vis_y0 - top) as f32;
-            let lx1 = (vis_x1 - left) as f32;
-            let ly1 = (vis_y1 - top) as f32;
             let mut color = fill.map(|top_color| {
                 lerp_color(
                     top_color,
@@ -975,11 +979,6 @@ fn dither_mesh(
             });
             if glows.hover && dither_lit(HOVER_DITHER, bayer) {
                 color = Some(MATCH_GREEN);
-            }
-            if let Some(outline) = glows.outline {
-                if on_outline(lx0, ly0, lx1, ly1, width, height) {
-                    color = Some(outline);
-                }
             }
             if let Some(color) = color {
                 push_solid_quad(
@@ -1017,10 +1016,47 @@ fn dither_mix(t: f32, bayer: u8, levels: u8) -> f32 {
     (step / (bands - 1.0)).clamp(0.0, 1.0)
 }
 
-/// True when this cell touches the tile edge, so the outline is one solid
-/// rendered pixel and does not stipple inward.
-fn on_outline(x0: f32, y0: f32, x1: f32, y1: f32, width: f32, height: f32) -> bool {
-    x0 <= 0.0 || y0 <= 0.0 || x1 >= width || y1 >= height
+/// Solid match frame. Every side is `grid.cell_px` device pixels, so a box
+/// that lands between grid lines gets the same line as one that lands on them.
+/// A tile smaller than that pixel is filled solid instead of growing a thinner line.
+fn outline_frame(rect: Rect, grid: &MapGrid) -> Vec<Rect> {
+    let ppp = grid.pixels_per_point.max(1.0);
+    let left = (rect.left() * ppp).round() as i32;
+    let top = (rect.top() * ppp).round() as i32;
+    let right = (rect.right() * ppp).round() as i32;
+    let bottom = (rect.bottom() * ppp).round() as i32;
+    let width = right - left;
+    let height = bottom - top;
+    if width <= 0 || height <= 0 {
+        return Vec::new();
+    }
+    let thickness = grid.cell_px.max(1).min(width).min(height);
+    let to_points = |x0: i32, y0: i32, x1: i32, y1: i32| {
+        Rect::from_min_max(
+            Pos2::new(x0 as f32 / ppp, y0 as f32 / ppp),
+            Pos2::new(x1 as f32 / ppp, y1 as f32 / ppp),
+        )
+    };
+    let mut bars = vec![to_points(left, top, right, (top + thickness).min(bottom))];
+    let bottom_y = (bottom - thickness).max(top);
+    if bottom_y > top {
+        bars.push(to_points(left, bottom_y, right, bottom));
+    }
+    let side_top = top + thickness;
+    let side_bottom = bottom - thickness;
+    if side_bottom > side_top {
+        bars.push(to_points(
+            left,
+            side_top,
+            (left + thickness).min(right),
+            side_bottom,
+        ));
+        let right_x = (right - thickness).max(left);
+        if right_x > left {
+            bars.push(to_points(right_x, side_top, right, side_bottom));
+        }
+    }
+    bars
 }
 
 fn dither_lit(coverage: f32, bayer: u8) -> bool {
@@ -1464,8 +1500,6 @@ mod tests {
 
     #[test]
     fn outline_and_hover_recolor_bayer_cells() {
-        assert!(on_outline(0.0, 0.0, 2.0, 2.0, 40.0, 40.0));
-        assert!(!on_outline(2.0, 2.0, 4.0, 4.0, 40.0, 40.0));
         assert!(dither_lit(HOVER_DITHER, 0));
         assert!(dither_lit(HOVER_DITHER, 3));
         assert!(!dither_lit(HOVER_DITHER, 4));
@@ -1475,16 +1509,6 @@ mod tests {
         let fill = Color32::from_rgb(200, 80, 40);
         let grid = aligned_grid(rect, 1.0, 2);
         let plain = dither_mesh(rect, &grid, Some(fill), &NO_GLOW).unwrap();
-        let outlined = dither_mesh(
-            rect,
-            &grid,
-            Some(fill),
-            &DitherGlows {
-                outline: Some(Color32::from_rgb(90, 220, 130)),
-                hover: false,
-            },
-        )
-        .unwrap();
         let hovered = dither_mesh(
             rect,
             &grid,
@@ -1496,11 +1520,7 @@ mod tests {
         )
         .unwrap();
         let match_green = MATCH_GREEN;
-        assert_eq!(color_at(&outlined, 0.0, 0.0), match_green);
-        assert_eq!(color_at(&outlined, 2.0, 0.0), match_green);
         assert_ne!(color_at(&plain, 0.0, 0.0), match_green);
-        assert_eq!(color_at(&outlined, 6.0, 16.0), color_at(&plain, 6.0, 16.0));
-        assert_eq!(color_at(&outlined, 2.0, 2.0), color_at(&plain, 2.0, 2.0));
         assert_eq!(color_at(&hovered, 20.0, 20.0), match_green);
         assert_ne!(color_at(&hovered, 6.0, 16.0), match_green);
         let period = Rect::from_min_max(Pos2::ZERO, Pos2::new(8.0, 8.0));
@@ -1523,6 +1543,40 @@ mod tests {
     }
 
     #[test]
+    fn match_outlines_share_one_thickness() {
+        let grid = MapGrid {
+            pixels_per_point: 2.0,
+            cell_px: MAP_PIXEL_PX,
+            origin_x: 0,
+            origin_y: 0,
+        };
+        let aligned = outline_frame(Rect::from_min_max(Pos2::ZERO, Pos2::new(40.0, 30.0)), &grid);
+        let offset = outline_frame(
+            Rect::from_min_max(Pos2::new(1.3, 2.2), Pos2::new(33.7, 28.4)),
+            &grid,
+        );
+        for bars in [&aligned, &offset] {
+            assert!(bars.len() >= 4);
+            assert_eq!(
+                span_px(bars[0].height(), grid.pixels_per_point),
+                MAP_PIXEL_PX
+            );
+            assert_eq!(
+                span_px(bars[1].height(), grid.pixels_per_point),
+                MAP_PIXEL_PX
+            );
+            assert_eq!(
+                span_px(bars[2].width(), grid.pixels_per_point),
+                MAP_PIXEL_PX
+            );
+            assert_eq!(
+                span_px(bars[3].width(), grid.pixels_per_point),
+                MAP_PIXEL_PX
+            );
+        }
+    }
+
+    #[test]
     fn directory_frames_alternate_grey_without_depending_on_glow() {
         assert_ne!(directory_grey(true, 0), directory_grey(true, 1));
         assert_eq!(directory_grey(true, 0), directory_grey(true, 2));
@@ -1532,6 +1586,10 @@ mod tests {
         assert_eq!(inner.top(), rect.top() + DIR_PAD);
         // The pad is the frame. The tile inset must not be what produces it.
         assert_ne!(DIR_PAD, TILE_INSET);
+    }
+
+    fn span_px(span: f32, pixels_per_point: f32) -> i32 {
+        (span * pixels_per_point).round() as i32
     }
 
     fn color_at(mesh: &Mesh, x: f32, y: f32) -> Color32 {
