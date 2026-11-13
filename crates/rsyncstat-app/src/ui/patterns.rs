@@ -16,6 +16,53 @@ pub struct PatternEditResult {
     pub text_gained_focus: bool,
 }
 
+/// Colors for the pattern fields, picked to match the active theme.
+struct FieldColors {
+    label: Color32,
+    fill: Color32,
+    border: Color32,
+    divider: Color32,
+    toggle_on: Color32,
+    toggle_hover: Color32,
+    icon: Color32,
+    icon_hover: Color32,
+    toggle_text: Color32,
+    toggle_text_active: Color32,
+}
+
+impl FieldColors {
+    fn for_visuals(visuals: &egui::Visuals) -> Self {
+        let g = Color32::from_gray;
+        if visuals.dark_mode {
+            Self {
+                label: g(204),
+                fill: g(60),
+                border: g(78),
+                divider: g(90),
+                toggle_on: g(92),
+                toggle_hover: g(74),
+                icon: g(176),
+                icon_hover: g(235),
+                toggle_text: g(150),
+                toggle_text_active: g(235),
+            }
+        } else {
+            Self {
+                label: g(70),
+                fill: g(255),
+                border: g(190),
+                divider: g(205),
+                toggle_on: g(214),
+                toggle_hover: g(232),
+                icon: g(100),
+                icon_hover: g(20),
+                toggle_text: g(110),
+                toggle_text_active: g(20),
+            }
+        }
+    }
+}
+
 /// One pattern row: a label, a full-width field, match toggles, and an icon
 /// sitting inside the field's right edge.
 pub fn pattern_edit(
@@ -29,7 +76,8 @@ pub fn pattern_edit(
     icon_tip: &str,
     want_keyboard_focus: bool,
 ) -> PatternEditResult {
-    ui.label(egui::RichText::new(label).color(Color32::from_gray(204)));
+    let colors = FieldColors::for_visuals(ui.visuals());
+    ui.label(egui::RichText::new(label).color(colors.label));
     ui.add_space(4.0);
     // Inset the field so the focus ring clears the panel edge.
     let inset = 4.0;
@@ -44,12 +92,11 @@ pub fn pattern_edit(
         ui.add_space(inset);
         let width = (ui.available_width() - inset).max(32.0);
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::hover());
-        ui.painter()
-            .rect_filled(rect, 4.0, Color32::from_rgb(60, 60, 60));
+        ui.painter().rect_filled(rect, 4.0, colors.fill);
         ui.painter().rect_stroke(
             rect,
             4.0,
-            Stroke::new(1.0, Color32::from_rgb(78, 78, 78)),
+            Stroke::new(1.0, colors.border),
             StrokeKind::Inside,
         );
 
@@ -72,7 +119,8 @@ pub fn pattern_edit(
             text_rect,
             egui::TextEdit::singleline(text)
                 .id_source(id)
-                .hint_text(hint)
+                .hint_text(egui::RichText::new(hint).color(colors.toggle_text))
+                .text_color(colors.icon_hover)
                 .frame(egui::Frame::NONE)
                 .margin(egui::Margin::symmetric(8, 4))
                 .align(egui::Align2::LEFT_CENTER)
@@ -93,7 +141,7 @@ pub fn pattern_edit(
         ui.painter().vline(
             icon_rect.left(),
             icon_rect.y_range().shrink(6.0),
-            Stroke::new(1.0, Color32::from_rgb(90, 90, 90)),
+            Stroke::new(1.0, colors.divider),
         );
 
         let clickable = matches!(icon, PatternIcon::Gear { .. });
@@ -113,9 +161,9 @@ pub fn pattern_edit(
             }
         }
         let color = if icon_response.hovered() {
-            Color32::from_gray(235)
+            colors.icon_hover
         } else {
-            Color32::from_gray(176)
+            colors.icon
         };
         match icon {
             PatternIcon::Book => paint_book(ui.painter(), icon_rect, color),
@@ -138,6 +186,7 @@ pub(super) fn paint_pattern_toggles(
     rect: Rect,
     options: &PatternOptions,
 ) -> Option<PatternToggle> {
+    let colors = FieldColors::for_visuals(ui.visuals());
     let buttons = [
         (
             PatternToggle::Case,
@@ -170,9 +219,9 @@ pub(super) fn paint_pattern_toggles(
         );
         let response = ui.interact(button, ui.scope_id().with((id, label)), Sense::click());
         let fill = if on {
-            Color32::from_rgb(92, 92, 92)
+            colors.toggle_on
         } else if response.hovered() {
-            Color32::from_rgb(74, 74, 74)
+            colors.toggle_hover
         } else {
             Color32::TRANSPARENT
         };
@@ -181,9 +230,9 @@ pub(super) fn paint_pattern_toggles(
                 .rect_filled(button.shrink2(Vec2::new(1.0, 4.0)), 3.0, fill);
         }
         let color = if on || response.hovered() {
-            Color32::from_gray(235)
+            colors.toggle_text_active
         } else {
-            Color32::from_gray(150)
+            colors.toggle_text
         };
         let text_rect = ui.painter().text(
             button.center(),
