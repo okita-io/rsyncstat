@@ -53,7 +53,8 @@ Disk visualizers show where the space goes but never move a byte. Two-way sync t
 
 **Include and exclude patterns**
 - Separate "files to include" and "files to exclude" fields with match-case, whole-word and regex toggles
-- Built-in preset list you can switch on or off; "Apply & rescan" re-walks both folders
+- Built-in junk excludes you can switch on or off; "Apply & rescan" re-walks both folders
+- Named packs (git, node, vite, rust, python) from the include field's ▾ menu; **+** appends a pack, **Add to presets…** saves the current fields to `include-exclude.yaml` next to the app
 
 **Keyboard first**
 - Tab follows the visual layout, with high-contrast focus rings
@@ -89,7 +90,7 @@ The release binary is `target/release/rsyncstat` (`rsyncstat.exe` on Windows). U
 | Crate | Role |
 |-------|------|
 | `rsyncstat-model` | Scan tree types, file colors, byte and path formatting |
-| `rsyncstat-filter` | Built-in exclude presets and gitignore-style rules |
+| `rsyncstat-filter` | Built-in exclude presets, named YAML packs, and gitignore-style rules |
 | `rsyncstat-scan` | Parallel walk, prunes excluded directories |
 | `rsyncstat-treemap` | Squarified layout and hit testing |
 | `rsyncstat-plan` | Compare two trees and decide which files to copy (pure logic) |

@@ -12,12 +12,12 @@ mod scan_ctl;
 mod sync_ctl;
 
 use crate::platform::run_after_event;
-use crate::{files, keyboard, ui, volume};
+use crate::{files, keyboard, presets, ui, volume};
 use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use eframe::egui::{self, Sense, Vec2};
 use pane::{PaneState, ScanStats};
 use rsyncstat_exec::SyncEvent;
-use rsyncstat_filter::{FilterSet, PatternOptions};
+use rsyncstat_filter::{FilterSet, NamedPreset, PatternOptions};
 use rsyncstat_model::{file_type_id, FileTypeId, TreeNode};
 use rsyncstat_plan::{CompareSummary, SyncPlan};
 use rsyncstat_scan::{scan_root_async, ScanUpdate};
@@ -77,6 +77,13 @@ struct RsyncStatApp {
     pattern_warning: String,
     /// Built-in excludes such as `.DS_Store`, `node_modules`, and `target`.
     use_preset_excludes: bool,
+    /// Named packs from `include-exclude.yaml` next to the binary.
+    named_presets: Vec<NamedPreset>,
+    preset_file: PathBuf,
+    /// Open "Save preset" dialog; the string is the name being typed.
+    preset_name_draft: Option<String>,
+    preset_dialog_error: String,
+    preset_dialog_focus: bool,
     compare: Option<CompareSummary>,
     compare_dirty: bool,
     preview: Option<SyncPlan>,
@@ -110,6 +117,9 @@ struct PendingDelete {
 
 impl RsyncStatApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let preset_file = presets::default_path();
+        let (named_presets, preset_notice) = presets::load_or_create(&preset_file);
+        let pattern_warning = preset_notice.unwrap_or_default();
         Self {
             filter: Arc::new(FilterSet::default_presets()),
             source: PaneState::new("Source (A): pick a folder to scan."),
@@ -122,8 +132,13 @@ impl RsyncStatApp {
             include_options: PatternOptions::default(),
             files_exclude: String::new(),
             exclude_options: PatternOptions::default(),
-            pattern_warning: String::new(),
+            pattern_warning,
             use_preset_excludes: true,
+            named_presets,
+            preset_file,
+            preset_name_draft: None,
+            preset_dialog_error: String::new(),
+            preset_dialog_focus: false,
             compare: None,
             compare_dirty: false,
             preview: None,

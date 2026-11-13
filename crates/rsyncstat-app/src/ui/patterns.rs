@@ -2,9 +2,15 @@
 
 use super::*;
 
-pub enum PatternIcon {
-    Book,
+pub enum PatternIcon<'a> {
     Gear { slashed: bool },
+    Presets { items: &'a [NamedPreset] },
+}
+
+pub enum PresetMenuAction {
+    None,
+    Apply(String),
+    SaveNew,
 }
 
 pub struct PatternEditResult {
@@ -14,6 +20,7 @@ pub struct PatternEditResult {
     pub rect: Rect,
     /// True when the text field took egui keyboard focus this frame (click or Tab).
     pub text_gained_focus: bool,
+    pub preset_action: PresetMenuAction,
 }
 
 /// Height shared by every button, text field and checkbox row.
@@ -77,7 +84,7 @@ pub fn pattern_edit(
     hint: &str,
     text: &mut String,
     options: &PatternOptions,
-    icon: PatternIcon,
+    icon: PatternIcon<'_>,
     icon_tip: &str,
     want_keyboard_focus: bool,
 ) -> PatternEditResult {
@@ -92,6 +99,7 @@ pub fn pattern_edit(
         toggled: None,
         rect: Rect::NOTHING,
         text_gained_focus: false,
+        preset_action: PresetMenuAction::None,
     };
     ui.horizontal(|ui| {
         ui.add_space(inset);
@@ -150,30 +158,30 @@ pub fn pattern_edit(
             Stroke::new(1.0, colors.divider),
         );
 
-        let clickable = matches!(icon, PatternIcon::Gear { .. });
-        let icon_response = ui.interact(
-            icon_rect,
-            ui.scope_id().with((id, "icon")),
-            if clickable {
-                Sense::click()
-            } else {
-                Sense::hover()
-            },
-        );
+        let icon_response =
+            ui.interact(icon_rect, ui.scope_id().with((id, "icon")), Sense::click());
         if icon_response.hovered() {
             icon_response.clone().on_hover_text(icon_tip);
-            if clickable {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         let color = if icon_response.hovered() {
             colors.icon_hover
         } else {
             colors.icon
         };
+        let mut preset_action = PresetMenuAction::None;
         match icon {
-            PatternIcon::Book => paint_book(ui.painter(), icon_rect, color),
-            PatternIcon::Gear { slashed } => paint_gear(ui.painter(), icon_rect, color, slashed),
+            PatternIcon::Gear { slashed } => {
+                paint_gear(ui.painter(), icon_rect, color, slashed);
+            }
+            PatternIcon::Presets { items } => {
+                let popup = egui::Popup::menu(&icon_response);
+                let open = popup.is_open() || icon_response.clicked();
+                paint_chevron(ui.painter(), icon_rect, color, open);
+                if let Some(inner) = popup.show(|ui| preset_menu(ui, items)) {
+                    preset_action = inner.inner;
+                }
+            }
         }
         result = PatternEditResult {
             submitted,
@@ -181,9 +189,94 @@ pub fn pattern_edit(
             toggled,
             rect,
             text_gained_focus,
+            preset_action,
         };
     });
     result
+}
+
+fn preset_menu(ui: &mut egui::Ui, items: &[NamedPreset]) -> PresetMenuAction {
+    ui.set_min_width(168.0);
+    ui.spacing_mut().item_spacing.y = 2.0;
+    let mut action = PresetMenuAction::None;
+    for preset in items {
+        let label = format!("+  {}", preset.name);
+        if ui
+            .add(egui::Button::new(label).fill(Color32::TRANSPARENT))
+            .on_hover_text("Append this pack to the include and exclude fields")
+            .clicked()
+        {
+            action = PresetMenuAction::Apply(preset.name.clone());
+            ui.close();
+        }
+    }
+    if !items.is_empty() {
+        ui.separator();
+    }
+    if ui.button("Add to presets…").clicked() {
+        action = PresetMenuAction::SaveNew;
+        ui.close();
+    }
+    action
+}
+
+pub enum SavePresetOutcome {
+    Stay,
+    Cancel,
+    Save,
+}
+
+/// Name a pack from the current include and exclude fields.
+pub fn save_preset_dialog(
+    ctx: &egui::Context,
+    name: &mut String,
+    error: &str,
+    request_focus: bool,
+) -> SavePresetOutcome {
+    let response = egui::Modal::new(egui::Id::unique("save_preset")).show(ctx, |ui| {
+        ui.set_min_width(320.0);
+        ui.heading("Save preset");
+        ui.label("Name this include/exclude pack. It is stored in include-exclude.yaml next to RSyncStat.");
+        ui.add_space(8.0);
+        let edit = ui.add(
+            egui::TextEdit::singleline(name)
+                .hint_text("git, node, photos…")
+                .desired_width(280.0),
+        );
+        if request_focus {
+            edit.request_focus();
+        }
+        let submitted =
+            edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if !error.is_empty() {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(error)
+                    .small()
+                    .color(Color32::from_rgb(240, 170, 60)),
+            );
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+                ui.close();
+                return Some(false);
+            }
+            let save = ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Save"));
+            if save.clicked() || submitted {
+                return Some(true);
+            }
+            None
+        })
+        .inner
+    });
+    if response.inner == Some(true) {
+        SavePresetOutcome::Save
+    } else if response.inner == Some(false) || response.should_close() {
+        SavePresetOutcome::Cancel
+    } else {
+        SavePresetOutcome::Stay
+    }
 }
 
 pub(super) fn paint_pattern_toggles(
@@ -265,32 +358,30 @@ pub(super) fn paint_pattern_toggles(
     toggled
 }
 
-pub(super) fn paint_book(painter: &egui::Painter, rect: Rect, color: Color32) {
+fn paint_chevron(painter: &egui::Painter, rect: Rect, color: Color32, open: bool) {
     let c = rect.center();
-    let stroke = Stroke::new(1.2, color);
-    let top = c.y - 5.5;
-    let bottom = c.y + 5.0;
-    let left = c.x - 7.0;
-    let right = c.x + 7.0;
-    painter.line_segment([Pos2::new(c.x, top + 1.0), Pos2::new(c.x, bottom)], stroke);
-    painter.line_segment(
-        [Pos2::new(c.x, top + 1.0), Pos2::new(left, top + 3.0)],
-        stroke,
-    );
-    painter.line_segment(
-        [Pos2::new(left, top + 3.0), Pos2::new(left, bottom)],
-        stroke,
-    );
-    painter.line_segment([Pos2::new(left, bottom), Pos2::new(c.x, bottom)], stroke);
-    painter.line_segment(
-        [Pos2::new(c.x, top + 1.0), Pos2::new(right, top + 3.0)],
-        stroke,
-    );
-    painter.line_segment(
-        [Pos2::new(right, top + 3.0), Pos2::new(right, bottom)],
-        stroke,
-    );
-    painter.line_segment([Pos2::new(right, bottom), Pos2::new(c.x, bottom)], stroke);
+    let stroke = Stroke::new(1.3, color);
+    let half = 4.0;
+    let drop = 2.4;
+    if open {
+        painter.line_segment(
+            [c + Vec2::new(-half, drop), c + Vec2::new(0.0, -drop)],
+            stroke,
+        );
+        painter.line_segment(
+            [c + Vec2::new(0.0, -drop), c + Vec2::new(half, drop)],
+            stroke,
+        );
+    } else {
+        painter.line_segment(
+            [c + Vec2::new(-half, -drop), c + Vec2::new(0.0, drop)],
+            stroke,
+        );
+        painter.line_segment(
+            [c + Vec2::new(0.0, drop), c + Vec2::new(half, -drop)],
+            stroke,
+        );
+    }
 }
 
 pub(super) fn paint_gear(painter: &egui::Painter, rect: Rect, color: Color32, slashed: bool) {

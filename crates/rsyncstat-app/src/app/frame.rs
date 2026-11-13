@@ -287,8 +287,10 @@ impl eframe::App for RsyncStatApp {
                     "*.rs, src/**",
                     &mut self.files_include,
                     &self.include_options,
-                    ui::PatternIcon::Book,
-                    "Comma-separated patterns. Empty includes every file that is not excluded. Aa matches case, ab matches a whole word, .* is a regular expression.",
+                    ui::PatternIcon::Presets {
+                        items: &self.named_presets,
+                    },
+                    "Named packs (git, node, vite, …). + appends that pack to the fields. Empty includes every file that is not excluded. Aa matches case, ab matches a whole word, .* is a regular expression.",
                     keyboard::is_focused(&self.kbd, keyboard::FocusId::ExcludeTypes),
                 );
                 self.paint_focus_if(ui, include.rect, keyboard::FocusId::ExcludeTypes);
@@ -357,6 +359,18 @@ impl eframe::App for RsyncStatApp {
                     }
                     if apply.clicked() || include.submitted || exclude.submitted {
                         refresh = true;
+                    }
+                    match &include.preset_action {
+                        ui::PresetMenuAction::None => {}
+                        ui::PresetMenuAction::Apply(name) => {
+                            self.apply_named_preset(name);
+                            refresh = false;
+                        }
+                        ui::PresetMenuAction::SaveNew => {
+                            self.preset_name_draft = Some(String::new());
+                            self.preset_dialog_error.clear();
+                            self.preset_dialog_focus = true;
+                        }
                     }
                     if refresh {
                         self.apply_excludes();
@@ -604,6 +618,7 @@ impl eframe::App for RsyncStatApp {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
         self.confirm_delete_modal(ui.ctx());
+        self.save_preset_modal(ui.ctx());
     }
 }
 

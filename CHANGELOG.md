@@ -5,6 +5,7 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 ## [Unreleased]
 
 ### Added
+- Named include/exclude packs (git, node, vite, rust, python) from a chevron menu, stored in `include-exclude.yaml` next to the app
 - Parallel scanner with gitignore-style exclude presets and hatched excluded tiles
 - Squarified treemap, directory tree and file-type legend
 - Two-pane layout with per-pane folder controls

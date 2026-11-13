@@ -69,6 +69,86 @@ impl RsyncStatApp {
             "Include and exclude patterns applied. Open folders are scanning again.".to_string();
     }
 
+    pub(super) fn apply_named_preset(&mut self, name: &str) {
+        if self.syncing {
+            return;
+        }
+        let Some(preset) = self
+            .named_presets
+            .iter()
+            .find(|preset| preset.name == name)
+            .cloned()
+        else {
+            self.sync_status = format!(
+                "Preset \"{name}\" is no longer in {}.",
+                crate::presets::FILE_NAME
+            );
+            return;
+        };
+        if preset.is_empty() {
+            self.sync_status = format!("Preset \"{name}\" has no include or exclude patterns.");
+            return;
+        }
+        preset.apply_to(&mut self.files_include, &mut self.files_exclude);
+        self.apply_excludes();
+        self.sync_status =
+            format!("Added \"{name}\" to include/exclude. Open folders are scanning again.");
+    }
+
+    pub(super) fn save_named_preset(&mut self, raw_name: &str) -> Result<(), String> {
+        let name = rsyncstat_filter::validate_preset_name(raw_name)?;
+        let include = rsyncstat_filter::field_patterns(&self.files_include);
+        let exclude = rsyncstat_filter::field_patterns(&self.files_exclude);
+        if include.is_empty() && exclude.is_empty() {
+            return Err("Type include or exclude patterns before saving a preset.".to_string());
+        }
+        let preset = rsyncstat_filter::NamedPreset {
+            name: name.clone(),
+            include,
+            exclude,
+        };
+        let mut next = self.named_presets.clone();
+        let created = rsyncstat_filter::upsert_preset(&mut next, preset);
+        crate::presets::save(&self.preset_file, &next)?;
+        self.named_presets = next;
+        self.sync_status = if created {
+            format!("Saved preset \"{name}\" to {}.", self.preset_file.display())
+        } else {
+            format!(
+                "Updated preset \"{name}\" in {}.",
+                self.preset_file.display()
+            )
+        };
+        Ok(())
+    }
+
+    pub(super) fn save_preset_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut name) = self.preset_name_draft.clone() else {
+            return;
+        };
+        let focus = self.preset_dialog_focus;
+        self.preset_dialog_focus = false;
+        let outcome = ui::save_preset_dialog(ctx, &mut name, &self.preset_dialog_error, focus);
+        self.preset_name_draft = Some(name.clone());
+        match outcome {
+            ui::SavePresetOutcome::Stay => {}
+            ui::SavePresetOutcome::Cancel => {
+                self.preset_name_draft = None;
+                self.preset_dialog_error.clear();
+            }
+            ui::SavePresetOutcome::Save => match self.save_named_preset(&name) {
+                Ok(()) => {
+                    self.preset_name_draft = None;
+                    self.preset_dialog_error.clear();
+                }
+                Err(message) => {
+                    self.preset_dialog_error = message;
+                    self.preset_dialog_focus = true;
+                }
+            },
+        }
+    }
+
     pub(super) fn start_sync(&mut self) {
         if self.syncing || !self.folders_idle() {
             return;

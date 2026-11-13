@@ -25,7 +25,7 @@ Rust stable 1.95+ (`rust-toolchain.toml`). Linux needs GTK/xkb dev packages, see
 | Crate | Owns | Must not |
 |-------|------|----------|
 | `rsyncstat-model` | Tree types, file colors, byte/path formatting | depend on other workspace crates |
-| `rsyncstat-filter` | Exclude presets, gitignore-style rules | touch the file system |
+| `rsyncstat-filter` | Exclude presets, named YAML packs, gitignore-style rules | touch the file system |
 | `rsyncstat-scan` | Parallel directory walk, streaming results | know about the UI |
 | `rsyncstat-treemap` | Squarified layout, hit testing | know about egui |
 | `rsyncstat-plan` | Compare trees, decide what to copy (pure logic) | touch the file system |
