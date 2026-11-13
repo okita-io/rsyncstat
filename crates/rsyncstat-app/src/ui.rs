@@ -36,14 +36,15 @@ const DIR_PAD: f32 = 2.0;
 /// Bottom edge of each tile is this fraction of the top color, so the box
 /// shades 30% darker toward its own bottom edge.
 const TILE_SHADE: f32 = 0.7;
-/// Same-file match. The outline is a solid line of this color, and hovering
-/// the match fills an even quarter of the cells with it.
+/// Same-file match. The outline is a solid line of this color.
 const MATCH_GREEN: Color32 = Color32::from_rgb(90, 220, 130);
 /// Share of cells filled by a hovered match. Flat across the box.
 const HOVER_DITHER: f32 = 0.25;
+/// Hover cells are the box color multiplied by this, so they are 30% brighter.
+const HOVER_BRIGHT: f32 = 1.3;
 const NO_GLOW: DitherGlows = DitherGlows {
     outline: None,
-    hover: false,
+    hover: None,
 };
 
 fn color_from_rgb(rgb: [u8; 3]) -> Color32 {
@@ -348,6 +349,13 @@ fn collect_buckets(node: &TreeNode, out: &mut HashMap<FileTypeId, u64>) {
     }
 }
 
+pub struct TileActions<'a> {
+    pub root: &'a std::path::Path,
+    /// Path and whether it is a directory, set when Delete is chosen.
+    pub delete: &'a mut Option<(PathBuf, bool)>,
+    pub notice: &'a mut Option<String>,
+}
+
 pub fn treemap_view(
     ui: &mut egui::Ui,
     root: &TreeNode,
@@ -357,6 +365,7 @@ pub fn treemap_view(
     other_files: Option<&HashMap<String, u64>>,
     space: &[SpaceTile],
     show_excluded: bool,
+    actions: &mut TileActions<'_>,
 ) {
     let visible = ui.available_rect_before_wrap().intersect(ui.clip_rect());
     if visible.width() < 2.0 || visible.height() < 2.0 {
@@ -394,6 +403,7 @@ pub fn treemap_view(
         space,
         1,
         show_excluded,
+        actions,
     );
 }
 
@@ -466,6 +476,7 @@ fn paint_children(
     extras: &[SpaceTile],
     depth: usize,
     show_excluded: bool,
+    actions: &mut TileActions<'_>,
 ) {
     let mut values = layout_values(&parent.children, live, show_excluded);
     for extra in extras {
@@ -515,6 +526,7 @@ fn paint_children(
             other_files,
             depth,
             show_excluded,
+            actions,
         );
         path.pop();
     }
@@ -537,6 +549,7 @@ fn paint_node(
     other_files: Option<&HashMap<String, u64>>,
     depth: usize,
     show_excluded: bool,
+    actions: &mut TileActions<'_>,
 ) {
     if rect.width() < 2.0 || rect.height() < 2.0 {
         return;
@@ -575,6 +588,7 @@ fn paint_node(
             node,
             mark,
             other_files.is_some(),
+            actions,
         );
         if inner.is_positive() {
             paint_children(
@@ -595,42 +609,50 @@ fn paint_node(
                 &[],
                 depth + 1,
                 show_excluded,
+                actions,
             );
         }
     } else if node.is_dir {
+        let color = color_from_rgb(readable_color_rgb(&node.name)).gamma_multiply(0.85);
         paint_tile_gradient(
             painter,
             grid,
             tile,
-            color_from_rgb(readable_color_rgb(&node.name)).gamma_multiply(0.85),
+            color,
             &DitherGlows {
                 outline: None,
-                hover: partner_here,
+                hover: partner_here.then_some(color),
             },
         );
     } else {
+        let color = color_from_rgb(file_color_rgb(&node.name));
         paint_tile_gradient(
             painter,
             grid,
             tile,
-            color_from_rgb(file_color_rgb(&node.name)),
+            color,
             &DitherGlows {
                 outline: mark.map(match_color),
-                hover: partner_here,
+                hover: partner_here.then_some(color),
             },
         );
     }
 
     // A nested folder and an excluded file have no dither fill of their own.
-    // The hover still stipples the same Bayer cells on top of what is there.
+    // The hover still stipples the same Bayer cells, in that box's color.
     if (nest || node.excluded) && partner_here {
+        let color = if node.excluded {
+            ui.visuals().weak_text_color()
+        } else {
+            directory_grey(ui.visuals().dark_mode, depth)
+        };
         paint_dither_overlay(
             painter,
             grid,
             if nest { rect } else { tile },
             &DitherGlows {
                 outline: None,
-                hover: true,
+                hover: Some(color),
             },
         );
     }
@@ -647,6 +669,7 @@ fn paint_node(
             node,
             mark,
             other_files.is_some(),
+            actions,
         );
     }
 }
@@ -812,6 +835,7 @@ fn track_pointer(
     node: &TreeNode,
     mark: Option<MatchKind>,
     other_compared: bool,
+    actions: &mut TileActions<'_>,
 ) -> bool {
     let id = parent_id.with(path.join("/"));
     let interact = ui.interact(rect, id, Sense::click());
@@ -820,9 +844,28 @@ fn track_pointer(
         *space_hover = None;
         show_tile_tip(&interact, hover_tip(rel, node, mark, other_compared));
     }
-    if interact.clicked() {
+    if interact.clicked() || interact.secondary_clicked() {
         *selected = Some(path.to_vec());
     }
+    let disk = crate::files::disk_path(actions.root, path);
+    interact.context_menu(|ui| {
+        if ui.button("Open File Location").clicked() {
+            if let Err(err) = crate::files::reveal(&disk) {
+                *actions.notice = Some(format!("Could not open {}: {err}", disk.display()));
+            }
+            ui.close();
+        }
+        if ui.button("Copy File Path").clicked() {
+            ui.ctx().copy_text(disk.display().to_string());
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Delete").clicked() {
+            *selected = Some(path.to_vec());
+            *actions.delete = Some((disk.clone(), node.is_dir));
+            ui.close();
+        }
+    });
     interact.hovered()
 }
 
@@ -900,17 +943,18 @@ fn map_cell_px(short_side_px: f32) -> i32 {
 /// 4×4 Bayer matrix. A cell uses the high color when its mix clears this threshold.
 const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
-/// Match outline is a solid edge. Hover fills an even quarter of the cells.
+/// Match outline is a solid edge. Hover is the box color, drawn on the same
+/// quarter of the Bayer cells.
 struct DitherGlows {
     outline: Option<Color32>,
-    hover: bool,
+    hover: Option<Color32>,
 }
 
 /// Each box shades from its own color at the top edge to 30% darker at the
 /// bottom edge. The fade is a pixel-aligned Bayer stipple, so neighboring
 /// boxes do not share one smooth gradient. A match outline is a solid frame
-/// one map pixel thick, and a hover fills an even quarter of the cells with
-/// the same green.
+/// one map pixel thick. A hover fills that same quarter of the cells with
+/// this box's color, 30% brighter.
 fn paint_tile_gradient(
     painter: &egui::Painter,
     grid: &MapGrid,
@@ -993,8 +1037,11 @@ fn dither_mesh(
                     dither_mix(t, bayer, DITHER_LEVELS),
                 )
             });
-            if glows.hover && dither_lit(HOVER_DITHER, bayer) {
-                color = Some(MATCH_GREEN);
+            if glows
+                .hover
+                .is_some_and(|_| dither_lit(HOVER_DITHER, bayer))
+            {
+                color = glows.hover.map(|base| shade_brighter(base, HOVER_BRIGHT));
             }
             if let Some(color) = color {
                 push_solid_quad(
@@ -1102,6 +1149,15 @@ fn push_solid_quad(mesh: &mut Mesh, rect: Rect, color: Color32) {
 
 /// Keep hue and alpha. Multiply the color channels so the result is darker.
 fn shade_darker(color: Color32, factor: f32) -> Color32 {
+    scale_channels(color, factor)
+}
+
+/// Keep hue and alpha. Multiply the color channels, clamped, so the result is brighter.
+fn shade_brighter(color: Color32, factor: f32) -> Color32 {
+    scale_channels(color, factor)
+}
+
+fn scale_channels(color: Color32, factor: f32) -> Color32 {
     let [r, g, b, a] = color.to_array();
     let scale = |channel: u8| (channel as f32 * factor).round().clamp(0.0, 255.0) as u8;
     Color32::from_rgba_unmultiplied(scale(r), scale(g), scale(b), a)
@@ -1640,7 +1696,7 @@ mod tests {
             Some(Color32::from_rgb(20, 40, 60)),
             &DitherGlows {
                 outline: Some(Color32::from_rgb(90, 220, 130)),
-                hover: true,
+                hover: Some(Color32::from_rgb(20, 40, 60)),
             },
         )
         .unwrap();
@@ -1668,14 +1724,15 @@ mod tests {
             Some(fill),
             &DitherGlows {
                 outline: None,
-                hover: true,
+                hover: Some(fill),
             },
         )
         .unwrap();
-        let match_green = MATCH_GREEN;
-        assert_ne!(color_at(&plain, 0.0, 0.0), match_green);
-        assert_eq!(color_at(&hovered, 20.0, 20.0), match_green);
-        assert_ne!(color_at(&hovered, 6.0, 16.0), match_green);
+        let bright = shade_brighter(fill, HOVER_BRIGHT);
+        assert_ne!(bright, MATCH_GREEN);
+        assert_eq!(color_at(&hovered, 20.0, 20.0), bright);
+        assert_eq!(color_at(&hovered, 6.0, 16.0), color_at(&plain, 6.0, 16.0));
+        assert_ne!(color_at(&hovered, 6.0, 16.0), bright);
         let period = Rect::from_min_max(Pos2::ZERO, Pos2::new(8.0, 8.0));
         let hovered_period = dither_mesh(
             period,
@@ -1683,16 +1740,16 @@ mod tests {
             Some(fill),
             &DitherGlows {
                 outline: None,
-                hover: true,
+                hover: Some(fill),
             },
         )
         .unwrap();
-        let green_quads = hovered_period
+        let bright_quads = hovered_period
             .vertices
             .chunks(4)
-            .filter(|quad| quad[0].color == match_green)
+            .filter(|quad| quad[0].color == bright)
             .count();
-        assert_eq!(green_quads, 4);
+        assert_eq!(bright_quads, 4);
     }
 
     #[test]

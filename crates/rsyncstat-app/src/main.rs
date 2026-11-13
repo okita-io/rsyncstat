@@ -1,5 +1,6 @@
 //! RSyncStat M0/M1 UI: dual-root treemap comparison.
 
+mod files;
 mod keyboard;
 mod sync;
 mod ui;
@@ -343,7 +344,16 @@ struct RsyncStatApp {
     /// Folder dialog started from a click. The panel itself runs after this
     /// event returns; see `pick_folder`.
     folder_pick: Option<(ActivePane, Receiver<Option<PathBuf>>)>,
+    /// File or folder the user asked to delete. The dialog confirms it.
+    confirm_delete: Option<PendingDelete>,
     kbd: keyboard::KeyboardState,
+}
+
+#[derive(Clone)]
+struct PendingDelete {
+    pane: ActivePane,
+    path: PathBuf,
+    is_dir: bool,
 }
 
 fn pattern_options_key(options: PatternOptions) -> String {
@@ -385,6 +395,7 @@ impl RsyncStatApp {
             recovery_lines: Vec::new(),
             mismatched_files: Vec::new(),
             folder_pick: None,
+            confirm_delete: None,
             kbd: keyboard::KeyboardState::default(),
         }
     }
@@ -1617,6 +1628,7 @@ impl eframe::App for RsyncStatApp {
         if self.source.scanning || self.target.scanning || self.syncing {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
+        self.confirm_delete_modal(ui.ctx());
     }
 }
 
@@ -1731,6 +1743,7 @@ impl RsyncStatApp {
         };
         let space_tiles = self.pane_space_tiles(pane);
         let show_excluded = self.pane(pane).show_excluded;
+        let root = self.pane(pane).root.clone().unwrap_or_default();
 
         if let Some(ref t) = tree {
             let (selected, hover, space_hover) = match pane {
@@ -1782,6 +1795,13 @@ impl RsyncStatApp {
                     space_hover,
                     partner_highlight_rel: partner_rel,
                 };
+                let mut delete = None;
+                let mut notice = None;
+                let mut actions = ui::TileActions {
+                    root: &root,
+                    delete: &mut delete,
+                    notice: &mut notice,
+                };
                 ui::treemap_view(
                     ui,
                     t,
@@ -1791,7 +1811,14 @@ impl RsyncStatApp {
                     other_ready.then_some(other_files.as_ref()),
                     &space_tiles,
                     show_excluded,
+                    &mut actions,
                 );
+                if let Some(message) = notice {
+                    self.sync_status = message;
+                }
+                if let Some((path, is_dir)) = delete {
+                    self.confirm_delete = Some(PendingDelete { pane, path, is_dir });
+                }
             }
         } else if scanning {
             ui.centered_and_justified(|ui| {
@@ -1801,6 +1828,73 @@ impl RsyncStatApp {
             ui.centered_and_justified(|ui| {
                 ui.label("Choose a folder to build the treemap.");
             });
+        }
+    }
+
+    fn confirm_delete_modal(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.confirm_delete.clone() else {
+            return;
+        };
+        let name = pending
+            .path
+            .file_name()
+            .map(|part| part.to_string_lossy().into_owned())
+            .unwrap_or_else(|| pending.path.display().to_string());
+        let response = egui::Modal::new(egui::Id::unique("delete_file")).show(ctx, |ui| {
+            ui.set_min_width(320.0);
+            if pending.is_dir {
+                ui.heading("Delete folder");
+                ui.label(format!(
+                    "Move \"{name}\" and everything inside it to the Trash?"
+                ));
+            } else {
+                ui.heading("Delete file");
+                ui.label(format!("Move \"{name}\" to the Trash?"));
+            }
+            ui.weak(pending.path.display().to_string());
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    ui.close();
+                    return Some(false);
+                }
+                if ui.button("Delete").clicked() {
+                    ui.close();
+                    return Some(true);
+                }
+                None
+            })
+            .inner
+        });
+        if response.inner == Some(true) {
+            self.confirm_delete = None;
+            self.delete_trashed(pending);
+        } else if response.inner == Some(false) || response.should_close() {
+            self.confirm_delete = None;
+        }
+    }
+
+    fn delete_trashed(&mut self, pending: PendingDelete) {
+        if self.syncing || self.pane(pending.pane).scanning {
+            self.sync_status = "Wait for the scan or sync to finish before deleting.".to_string();
+            return;
+        }
+        let root = self.pane(pending.pane).root.clone();
+        if root.as_ref().is_some_and(|root| root == &pending.path) {
+            self.sync_status = "The scanned folder itself stays put.".to_string();
+            return;
+        }
+        match files::move_to_trash(&pending.path) {
+            Ok(()) => {
+                let kind = if pending.is_dir { "folder" } else { "file" };
+                self.sync_status = format!("Moved {kind} {} to the Trash.", pending.path.display());
+                if let Some(root) = root {
+                    self.start_scan(pending.pane, root);
+                }
+            }
+            Err(err) => {
+                self.sync_status = format!("Could not delete {}: {err}", pending.path.display());
+            }
         }
     }
 }

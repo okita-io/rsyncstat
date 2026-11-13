@@ -21,6 +21,7 @@ eframe.workspace = true
 rfd.workspace = true
 crossbeam-channel.workspace = true
 blake3.workspace = true
+trash.workspace = true
 egui_ltreeview = "0.10.0"
 
 [target.'cfg(unix)'.dependencies]
