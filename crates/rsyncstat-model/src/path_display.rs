@@ -11,7 +11,7 @@ pub fn elide_path_for_width(path: &str, max_width: f32, measure: impl Fn(&str) -
         return path.to_string();
     }
 
-    let is_win = path.contains('\\') || path.bytes().nth(1) == Some(b':');
+    let is_win = path.contains('\\') || path.as_bytes().get(1).copied() == Some(b':');
     let sep = if is_win { '\\' } else { '/' };
     let (root_prefix, segments) = parse_segments(path, sep);
 
@@ -65,9 +65,9 @@ fn parse_segments(path: &str, sep: char) -> (String, Vec<String>) {
         if let Some(colon) = norm.find(':') {
             root_prefix = norm[..=colon].to_string();
             let after = &norm[colon + 1..];
-            if after.starts_with('\\') {
+            if let Some(stripped) = after.strip_prefix('\\') {
                 root_prefix.push('\\');
-                rest = &after[1..];
+                rest = stripped;
             } else {
                 rest = after;
             }

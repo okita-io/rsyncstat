@@ -3053,25 +3053,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsyncstat-agent"
-version = "0.1.0"
-dependencies = [
- "rsyncstat-filter",
- "rsyncstat-scan",
-]
-
-[[package]]
 name = "rsyncstat-app"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "crossbeam-channel",
  "eframe",
  "egui_ltreeview",
  "libc",
  "rfd",
+ "rsyncstat-exec",
  "rsyncstat-filter",
  "rsyncstat-model",
+ "rsyncstat-plan",
  "rsyncstat-scan",
  "rsyncstat-treemap",
  "trash",
@@ -3082,7 +3075,12 @@ dependencies = [
 name = "rsyncstat-exec"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "crossbeam-channel",
+ "rsyncstat-filter",
+ "rsyncstat-model",
  "rsyncstat-plan",
+ "rsyncstat-scan",
 ]
 
 [[package]]
@@ -3091,14 +3089,6 @@ version = "0.1.0"
 dependencies = [
  "ignore",
  "regex",
- "serde",
-]
-
-[[package]]
-name = "rsyncstat-index"
-version = "0.1.0"
-dependencies = [
- "rsyncstat-model",
 ]
 
 [[package]]
@@ -3113,13 +3103,7 @@ dependencies = [
 name = "rsyncstat-plan"
 version = "0.1.0"
 dependencies = [
- "rsyncstat-model",
-]
-
-[[package]]
-name = "rsyncstat-reconcile"
-version = "0.1.0"
-dependencies = [
+ "rsyncstat-filter",
  "rsyncstat-model",
 ]
 
@@ -3132,13 +3116,6 @@ dependencies = [
  "num_cpus",
  "rsyncstat-filter",
  "rsyncstat-model",
-]
-
-[[package]]
-name = "rsyncstat-transport"
-version = "0.1.0"
-dependencies = [
- "rsyncstat-exec",
 ]
 
 [[package]]

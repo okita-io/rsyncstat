@@ -42,15 +42,13 @@ impl PatternOptions {
     }
 }
 
-pub use presets::{default_preset_rules, PresetGroup};
+pub use presets::default_preset_rules;
 
-/// Where a matching rule came from (more levels in M1).
+/// Where a matching rule came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuleLevel {
     BuiltinPreset,
     Profile,
-    Global,
-    RsyncIgnore,
 }
 
 /// Result of evaluating a path against the active filter set.
@@ -76,7 +74,7 @@ impl Verdict {
     }
 }
 
-/// Compiled filter rules (M0: built-in presets plus optional extra lines).
+/// Compiled filter rules (built-in presets plus optional extra lines).
 #[derive(Debug, Clone)]
 pub struct FilterSet {
     gitignore: Arc<Gitignore>,
@@ -181,11 +179,6 @@ impl FilterSet {
             };
         }
         self.match_path(rel, is_dir)
-    }
-
-    /// Whether a directory should be pruned during scan (excluded folder).
-    pub fn should_prune_dir(&self, rel: &Path) -> bool {
-        self.verdict(rel, true).excluded
     }
 
     fn excluded_ancestor(&self, rel: &Path) -> Option<PathBuf> {
@@ -668,8 +661,15 @@ mod tests {
         assert!(!f.verdict(&deploy, false).excluded);
     }
 
-    fn excludes(include: &str, include_opts: PatternOptions, exclude: &str, exclude_opts: PatternOptions, rel: &str) -> bool {
-        let (filter, errors) = FilterSet::from_rules(include, include_opts, exclude, exclude_opts, false);
+    fn excludes(
+        include: &str,
+        include_opts: PatternOptions,
+        exclude: &str,
+        exclude_opts: PatternOptions,
+        rel: &str,
+    ) -> bool {
+        let (filter, errors) =
+            FilterSet::from_rules(include, include_opts, exclude, exclude_opts, false);
         assert!(errors.is_empty(), "{errors:?}");
         filter.verdict(Path::new(rel), false).excluded
     }
@@ -682,7 +682,13 @@ mod tests {
         };
         // Empty include with match-case on forces the regex compiler, so the
         // exclude glob below is case-insensitive and should agree with gitignore.
-        let (filter, errors) = FilterSet::from_rules("", case, "*.log, node_modules, src/**", PatternOptions::default(), false);
+        let (filter, errors) = FilterSet::from_rules(
+            "",
+            case,
+            "*.log, node_modules, src/**",
+            PatternOptions::default(),
+            false,
+        );
         assert!(errors.is_empty(), "{errors:?}");
         let samples = [
             "notes.log",
@@ -730,9 +736,27 @@ mod tests {
             match_case: true,
             ..PatternOptions::default()
         };
-        assert!(excludes("", PatternOptions::default(), "*.TXT", case, "notes.TXT"));
-        assert!(!excludes("", PatternOptions::default(), "*.TXT", case, "notes.txt"));
-        assert!(excludes("", PatternOptions::default(), "*.txt", PatternOptions::default(), "notes.TXT"));
+        assert!(excludes(
+            "",
+            PatternOptions::default(),
+            "*.TXT",
+            case,
+            "notes.TXT"
+        ));
+        assert!(!excludes(
+            "",
+            PatternOptions::default(),
+            "*.TXT",
+            case,
+            "notes.txt"
+        ));
+        assert!(excludes(
+            "",
+            PatternOptions::default(),
+            "*.txt",
+            PatternOptions::default(),
+            "notes.TXT"
+        ));
     }
 
     #[test]
@@ -741,14 +765,56 @@ mod tests {
             whole_word: true,
             ..PatternOptions::default()
         };
-        assert!(excludes("", PatternOptions::default(), "log", word, "notes.log"));
+        assert!(excludes(
+            "",
+            PatternOptions::default(),
+            "log",
+            word,
+            "notes.log"
+        ));
         assert!(excludes("", PatternOptions::default(), "log", word, "log"));
-        assert!(!excludes("", PatternOptions::default(), "log", word, "catalog.txt"));
-        assert!(!excludes("", PatternOptions::default(), "log", word, "login.txt"));
-        assert!(!excludes("", PatternOptions::default(), "*log*", word, "catalog.txt"));
-        assert!(excludes("", PatternOptions::default(), "*log*", word, "my-log.txt"));
-        assert!(!excludes("", PatternOptions::default(), "log", PatternOptions::default(), "notes.log"));
-        assert!(excludes("", PatternOptions::default(), "log", PatternOptions::default(), "dir/log"));
+        assert!(!excludes(
+            "",
+            PatternOptions::default(),
+            "log",
+            word,
+            "catalog.txt"
+        ));
+        assert!(!excludes(
+            "",
+            PatternOptions::default(),
+            "log",
+            word,
+            "login.txt"
+        ));
+        assert!(!excludes(
+            "",
+            PatternOptions::default(),
+            "*log*",
+            word,
+            "catalog.txt"
+        ));
+        assert!(excludes(
+            "",
+            PatternOptions::default(),
+            "*log*",
+            word,
+            "my-log.txt"
+        ));
+        assert!(!excludes(
+            "",
+            PatternOptions::default(),
+            "log",
+            PatternOptions::default(),
+            "notes.log"
+        ));
+        assert!(excludes(
+            "",
+            PatternOptions::default(),
+            "log",
+            PatternOptions::default(),
+            "dir/log"
+        ));
     }
 
     #[test]
@@ -757,22 +823,53 @@ mod tests {
             regex: true,
             ..PatternOptions::default()
         };
-        assert!(excludes("", PatternOptions::default(), r"\.log$", regex, "dir/notes.log"));
-        assert!(!excludes("", PatternOptions::default(), r"\.log$", regex, "dir/notes.logout"));
+        assert!(excludes(
+            "",
+            PatternOptions::default(),
+            r"\.log$",
+            regex,
+            "dir/notes.log"
+        ));
+        assert!(!excludes(
+            "",
+            PatternOptions::default(),
+            r"\.log$",
+            regex,
+            "dir/notes.logout"
+        ));
         let case = PatternOptions {
             regex: true,
             match_case: true,
             ..PatternOptions::default()
         };
-        assert!(!excludes("", PatternOptions::default(), r"\.log$", case, "notes.LOG"));
+        assert!(!excludes(
+            "",
+            PatternOptions::default(),
+            r"\.log$",
+            case,
+            "notes.LOG"
+        ));
         let word = PatternOptions {
             regex: true,
             whole_word: true,
             ..PatternOptions::default()
         };
-        assert!(excludes("", PatternOptions::default(), "log", word, "notes.log"));
-        assert!(!excludes("", PatternOptions::default(), "log", word, "catalog"));
-        let (filter, errors) = FilterSet::from_rules("", PatternOptions::default(), "(", regex, false);
+        assert!(excludes(
+            "",
+            PatternOptions::default(),
+            "log",
+            word,
+            "notes.log"
+        ));
+        assert!(!excludes(
+            "",
+            PatternOptions::default(),
+            "log",
+            word,
+            "catalog"
+        ));
+        let (filter, errors) =
+            FilterSet::from_rules("", PatternOptions::default(), "(", regex, false);
         assert!(!errors.is_empty());
         assert!(!filter.verdict(Path::new("notes.log"), false).excluded);
     }
@@ -783,10 +880,40 @@ mod tests {
             match_case: true,
             ..PatternOptions::default()
         };
-        assert!(!excludes("*.txt", case, "", PatternOptions::default(), "a.txt"));
-        assert!(excludes("*.txt", case, "", PatternOptions::default(), "a.TXT"));
-        assert!(excludes("*.txt", case, "", PatternOptions::default(), "a.rs"));
-        assert!(!excludes("skip", PatternOptions::default(), "", PatternOptions::default(), "skip/secret.txt"));
-        assert!(excludes("*.txt", PatternOptions::default(), "*.log", PatternOptions::default(), "notes.log"));
+        assert!(!excludes(
+            "*.txt",
+            case,
+            "",
+            PatternOptions::default(),
+            "a.txt"
+        ));
+        assert!(excludes(
+            "*.txt",
+            case,
+            "",
+            PatternOptions::default(),
+            "a.TXT"
+        ));
+        assert!(excludes(
+            "*.txt",
+            case,
+            "",
+            PatternOptions::default(),
+            "a.rs"
+        ));
+        assert!(!excludes(
+            "skip",
+            PatternOptions::default(),
+            "",
+            PatternOptions::default(),
+            "skip/secret.txt"
+        ));
+        assert!(excludes(
+            "*.txt",
+            PatternOptions::default(),
+            "*.log",
+            PatternOptions::default(),
+            "notes.log"
+        ));
     }
 }

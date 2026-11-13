@@ -428,6 +428,7 @@ fn append_recovery_line(path: &Path, line: &str) -> io::Result<()> {
 ///
 /// The directory that failed the first walk is already in the tree, so it is
 /// not emitted again. Its children are.
+#[allow(clippy::too_many_arguments)]
 fn reread(
     root: &Path,
     failed: &Path,

@@ -126,19 +126,12 @@ pub fn squarify_indices(values: &[f64], x: f32, y: f32, w: f32, h: f32) -> Vec<L
 }
 
 /// Squarified treemap for items with positive `value(item)`.
-pub fn squarify<T, F>(
-    items: &[T],
-    mut value: F,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-) -> Vec<LayoutItem<T>>
+pub fn squarify<T, F>(items: &[T], value: F, x: f32, y: f32, w: f32, h: f32) -> Vec<LayoutItem<T>>
 where
     T: Clone,
     F: FnMut(&T) -> f64,
 {
-    let values: Vec<f64> = items.iter().map(|item| value(item)).collect();
+    let values: Vec<f64> = items.iter().map(value).collect();
     squarify_indices(&values, x, y, w, h)
         .into_iter()
         .map(|li| LayoutItem {

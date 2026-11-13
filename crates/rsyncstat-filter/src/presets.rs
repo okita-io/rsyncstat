@@ -1,13 +1,5 @@
 //! Built-in exclude preset lines (see `docs/SPEC.md`).
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PresetGroup {
-    SystemJunk,
-    TempAndLiveDb,
-    Rebuildable,
-    RsyncstatState,
-}
-
 pub fn default_preset_rules() -> Vec<&'static str> {
     vec![
         // system junk

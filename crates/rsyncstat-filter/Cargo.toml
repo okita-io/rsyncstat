@@ -10,4 +10,3 @@ description = "Gitignore-style exclude filters for RSyncStat"
 [dependencies]
 ignore.workspace = true
 regex = "1"
-serde.workspace = true

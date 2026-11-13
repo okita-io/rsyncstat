@@ -4,14 +4,10 @@ members = [
     "crates/rsyncstat-model",
     "crates/rsyncstat-filter",
     "crates/rsyncstat-scan",
-    "crates/rsyncstat-index",
-    "crates/rsyncstat-reconcile",
     "crates/rsyncstat-plan",
     "crates/rsyncstat-exec",
-    "crates/rsyncstat-transport",
     "crates/rsyncstat-treemap",
     "crates/rsyncstat-app",
-    "crates/rsyncstat-agent",
 ]
 
 [workspace.package]
@@ -26,10 +22,7 @@ serde = { version = "1", features = ["derive"] }
 ignore = "0.4"
 rayon = "1"
 blake3 = "1"
-redb = "4"
 trash = "5"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-postcard = { version = "1", features = ["alloc"] }
 eframe = { version = "0.37", default-features = true }
 rfd = "0.15"
 crossbeam-channel = "0.5"

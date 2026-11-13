@@ -1,6 +1,7 @@
-//! Shared scan tree model (arena-oriented layout for later milestones).
+//! Shared scan tree model, file-type colors and display helpers.
 
 mod file_color;
+mod format;
 mod path_display;
 
 use serde::{Deserialize, Serialize};
@@ -8,12 +9,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use file_color::{file_color_rgb, file_type_id, readable_color_rgb, FileTypeId};
+pub use format::format_bytes;
 pub use path_display::elide_path_for_width;
 
 /// Stable node identifier for future arena storage.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NodeId(pub u32);
-
 /// A node in a directory tree built from a scan.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TreeNode {
@@ -21,10 +20,12 @@ pub struct TreeNode {
     pub size: u64,
     pub is_dir: bool,
     pub excluded: bool,
-    /// Human-readable hint for which rule excluded this path (M0: pattern text).
+    /// Human-readable hint for which rule excluded this path (the pattern text).
     pub exclude_rule: Option<String>,
     pub children: Vec<TreeNode>,
     /// Child name → index. Present only after a child has been inserted.
+    // Boxed so a leaf node stays one pointer wide.
+    #[allow(clippy::box_collection)]
     #[serde(skip)]
     child_index: Option<Box<HashMap<String, usize>>>,
 }
@@ -70,6 +71,18 @@ impl TreeNode {
             return index.get(name).map(|&i| &self.children[i]);
         }
         self.children.iter().find(|c| c.name == name)
+    }
+
+    /// Follow `path` down from this node. The first segment must be this node's name.
+    pub fn find_by_path(&self, path: &[String]) -> Option<&TreeNode> {
+        if path.first()? != &self.name {
+            return None;
+        }
+        let mut node = self;
+        for part in path.iter().skip(1) {
+            node = node.child(part)?;
+        }
+        Some(node)
     }
 
     /// Insert one path discovered by the scanner.
