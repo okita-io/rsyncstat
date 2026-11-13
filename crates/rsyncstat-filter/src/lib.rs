@@ -55,10 +55,27 @@ impl FilterSet {
 
     pub fn from_lines(lines: &[&str], level: RuleLevel) -> Self {
         let mut builder = GitignoreBuilder::new(".");
+        builder
+            .case_insensitive(true)
+            .expect("case flag is accepted");
         for line in lines {
             builder.add_line(None, line).expect("invalid preset line");
         }
         let gitignore = Arc::new(builder.build().expect("failed to build gitignore"));
+        Self { gitignore, level }
+    }
+
+    /// Like [`Self::from_lines`], but a pattern the ignore crate rejects is skipped
+    /// instead of aborting. Used for text typed into the include and exclude fields.
+    pub fn from_user_lines(lines: &[&str], level: RuleLevel) -> Self {
+        let mut builder = GitignoreBuilder::new(".");
+        builder
+            .case_insensitive(true)
+            .expect("case flag is accepted");
+        for line in lines {
+            let _ = builder.add_line(None, line);
+        }
+        let gitignore = Arc::new(builder.build().unwrap_or_else(|_| Gitignore::empty()));
         Self { gitignore, level }
     }
 
