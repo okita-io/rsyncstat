@@ -3,7 +3,8 @@
 #
 #   scripts/bundle-macos.sh
 #
-# Output: target/release/bundle/osx/RSyncStat.app and dist/RSyncStat-macos.zip
+# Output: target/release/bundle/osx/RSyncStat.app, dist/RSyncStat-macos.zip and
+# dist/RSyncStat.dmg (drag-to-Applications disk image, signed and notarized)
 #
 # Environment:
 #   SIGN_IDENTITY   Name or SHA-1 of a "Developer ID Application" identity.
@@ -57,28 +58,48 @@ codesign --verify --deep --strict --verbose=2 "$app"
 
 mkdir -p "$dist"
 zip="$dist/RSyncStat-macos.zip"
-rm -f "$zip"
-ditto -c -k --keepParent "$app" "$zip"
+dmg="$dist/RSyncStat.dmg"
+make_zip() { rm -f "$zip"; ditto -c -k --keepParent "$app" "$zip"; }
+
+# make_dmg: a disk image holding the app and an Applications shortcut.
+make_dmg() {
+  local stage
+  stage="$(mktemp -d)"
+  cp -R "$app" "$stage/"
+  ln -s /Applications "$stage/Applications"
+  rm -f "$dmg"
+  hdiutil create -quiet -volname "RSyncStat" -srcfolder "$stage" \
+    -format UDZO -fs HFS+ "$dmg"
+  rm -rf "$stage"
+  codesign --force --timestamp --sign "$identity" "$dmg"
+  codesign --verify --verbose=2 "$dmg"
+}
+
+make_zip
 
 if [ -z "${NOTARY_PROFILE:-}" ]; then
+  echo "==> Building the disk image"
+  make_dmg
   echo "NOTARY_PROFILE not set: signed but NOT notarized."
   echo "Gatekeeper will still warn on other Macs. See the header of this script."
-  echo "Signed zip: $zip"
+  echo "Signed: $zip and $dmg"
   exit 0
 fi
 
-echo "==> Notarizing (this can take a few minutes)"
+echo "==> Notarizing the app (this can take a few minutes)"
 xcrun notarytool submit "$zip" --keychain-profile "$NOTARY_PROFILE" --wait
-
-echo "==> Stapling the ticket"
 xcrun stapler staple "$app"
 xcrun stapler validate "$app"
+make_zip   # rebuild so the zip holds the stapled app
 
-# Rebuild the zip so it contains the stapled app.
-rm -f "$zip"
-ditto -c -k --keepParent "$app" "$zip"
+echo "==> Building and notarizing the disk image"
+make_dmg
+xcrun notarytool submit "$dmg" --keychain-profile "$NOTARY_PROFILE" --wait
+xcrun stapler staple "$dmg"
+xcrun stapler validate "$dmg"
 
 echo "==> Gatekeeper check"
 spctl --assess --type execute --verbose=2 "$app"
+spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
 
-echo "done: $zip"
+echo "done: $zip and $dmg"

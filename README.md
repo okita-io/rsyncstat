@@ -102,10 +102,10 @@ To sign with your Developer ID and notarize, use the helper instead (macOS only)
 ```bash
 # one time: store notarization credentials in your keychain
 xcrun notarytool store-credentials rsyncstat-notary --apple-id you@example.com --team-id TEAMID
-NOTARY_PROFILE=rsyncstat-notary scripts/bundle-macos.sh   # writes dist/RSyncStat-macos.zip
+NOTARY_PROFILE=rsyncstat-notary scripts/bundle-macos.sh   # writes dist/RSyncStat.dmg and dist/RSyncStat-macos.zip
 ```
 
-Without `NOTARY_PROFILE` it signs but skips notarization; `SKIP_SIGN=1` builds the bundle only. The `.dmg` that cargo-bundle also writes is not signed; share the zip.
+Without `NOTARY_PROFILE` it signs but skips notarization; `SKIP_SIGN=1` builds the bundle only. The script builds its own drag-to-Applications `dist/RSyncStat.dmg`; ignore the unsigned `.dmg` that cargo-bundle writes.
 
 ### Icons
 
