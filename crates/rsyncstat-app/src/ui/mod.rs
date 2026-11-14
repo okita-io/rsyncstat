@@ -249,6 +249,63 @@ mod tests {
     }
 
     #[test]
+    fn directory_tree_rows_are_single_spaced_under_app_spacing() {
+        let root = sample_tree();
+        let ctx = egui::Context::default();
+        let mut selected = None;
+        let mut hover = None;
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 480.0));
+        // Draws one frame; returns the tree's top edge and its row height.
+        let mut frame = |pointer: Option<Pos2>, step: u32, hover: &mut Option<Vec<String>>| {
+            let mut top = 0.0;
+            let mut row_h = 0.0;
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(f64::from(step) / 60.0),
+                events: pointer
+                    .map(|pos| vec![egui::Event::PointerMoved(pos)])
+                    .unwrap_or_default(),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                // The app's global spacing: tall controls, wide gaps.
+                ui.spacing_mut().interact_size.y = CONTROL_HEIGHT;
+                ui.spacing_mut().item_spacing.y = 5.0;
+                row_h = tree_row_height(ui.text_style_height(&egui::TextStyle::Body));
+                top = ui.cursor().min.y;
+                tree_view_with_path(
+                    ui,
+                    &root,
+                    &["stories".to_string()],
+                    &mut selected,
+                    hover,
+                    None,
+                    None,
+                );
+            });
+            output.drop_without_applying_deltas();
+            (top, row_h)
+        };
+        frame(None, 0, &mut hover);
+        let (top, row_h) = frame(None, 1, &mut hover);
+        assert!(
+            row_h < CONTROL_HEIGHT - 5.0,
+            "row height {row_h} is not single spaced"
+        );
+        // The middle of the second single-height row is still inside the first
+        // row when rows use the 30 px control height plus the 5 px gap.
+        let second_row = Pos2::new(72.0, top + row_h * 1.5);
+        frame(Some(second_row), 2, &mut hover);
+        frame(Some(second_row), 3, &mut hover);
+        assert_eq!(
+            hover.as_deref(),
+            Some(&["stories".to_string(), "one.txt".to_string()][..]),
+            "pointer at y={} should hover the second row",
+            second_row.y
+        );
+    }
+
+    #[test]
     fn hidden_excluded_files_drop_out_of_the_layout() {
         let mut folder = TreeNode::new_dir("photos");
         folder.children.push(TreeNode::file("keep.jpg", 100));
