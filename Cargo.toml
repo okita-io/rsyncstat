@@ -24,7 +24,7 @@ rayon = "1"
 blake3 = "1"
 trash = "5"
 eframe = { version = "0.37", default-features = true }
-rfd = "0.15"
+rfd = "0.18"
 crossbeam-channel = "0.5"
 num_cpus = "1"
 # Single `windows` version for wgpu-hal 30 + gpu-allocator 0.28 (DX12); see README.
