@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// Vertical padding around one line of text in a directory tree row.
+const TREE_ROW_PAD: f32 = 4.0;
+
+/// Height of one directory tree row: a single line of text plus a little padding.
+pub(super) fn tree_row_height(text_height: f32) -> f32 {
+    text_height + TREE_ROW_PAD
+}
+
 pub fn tree_view_with_path(
     ui: &mut egui::Ui,
     node: &TreeNode,
@@ -12,6 +20,14 @@ pub fn tree_view_with_path(
     other_files: Option<&HashMap<String, u64>>,
 ) {
     let tree_id = ui.scope_id().with("directory_tree");
+    // The app sets `interact_size.y` to the 30 px control height and widens
+    // `item_spacing.y` for focus rings. egui_ltreeview builds each row from
+    // both (and ignores its own `default_node_height`), which made rows
+    // double spaced. Size rows to one line of text instead.
+    let row_h = tree_row_height(ui.text_style_height(&egui::TextStyle::Body));
+    let spacing = ui.spacing_mut();
+    spacing.interact_size.y = row_h;
+    spacing.item_spacing.y = 0.0;
     let mut state: TreeViewState<Vec<String>> =
         TreeViewState::load(ui, tree_id).unwrap_or_default();
     match selected {

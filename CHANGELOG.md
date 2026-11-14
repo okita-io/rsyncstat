@@ -31,6 +31,7 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 - Unused `PresetGroup`, `NodeId`, `should_prune_dir` and placeholder rule levels
 
 ### Fixed
+- Directory tree rows were double spaced (the 30 px control height plus the focus gap); each row is now one line of text
 - The left panel's edge line ran down through the status bar when the file types section had no room left
 - Folder and include/exclude field text sat on the left stroke because custom frames dropped TextEdit padding
 - A symlinked directory on the target could redirect a copy outside the target root
