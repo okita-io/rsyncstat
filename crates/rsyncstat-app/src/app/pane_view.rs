@@ -13,7 +13,6 @@ impl RsyncStatApp {
         other_hover: &Option<Vec<String>>,
     ) {
         let scanning = self.pane(pane).scanning;
-        let pad = keyboard::FOCUS_PAD;
         ui.set_max_size(size);
         let bounds = ui.max_rect();
         // Leave room for focus rings around toolbar buttons at the pane edge.
@@ -22,7 +21,6 @@ impl RsyncStatApp {
                 .intersect(bounds)
                 .expand(keyboard::FOCUS_RING_OUTSET),
         );
-        ui.add_space(pad);
         let (choose_id, open_id, rescan_id, treemap_id) = match pane {
             ActivePane::Source => (
                 keyboard::FocusId::PaneAChoose,

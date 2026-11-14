@@ -113,7 +113,7 @@ Keyboard-first interaction is a first-class requirement, tuned for **Omarchy (Hy
 
 ### Focus and Tab order
 
-- **Tab** / **Shift+Tab** move focus through every interactive control in a fixed **left-to-right, top-to-bottom** order: menu and sync bar, left tree panel, then **pane A** controls and treemap, then **pane B** (when side-by-side). Non-interactive labels and legends are skipped.
+- **Tab** / **Shift+Tab** move focus through every interactive control in a fixed **left-to-right, top-to-bottom** order, row by row across the whole window: Source, Target, Run sync, **Source…**, **Target…**; then the pane buttons (Open source, Rescan, Open target, Rescan); then the rest of the left tree panel; then treemap A, the splitter and treemap B. Non-interactive labels and legends are skipped.
 - The focused control gets a **high-contrast focus ring** (rounded stroke using the theme’s selection color).
 - **Enter** or **Space** activates the focused control (button, checkbox, tab, combo).
 - **Escape** closes the shortcut cheat sheet, then cancels an in-flight **sync** or **scan** on the active pane (cooperative cancel, same as Rescan).

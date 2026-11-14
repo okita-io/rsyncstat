@@ -82,48 +82,17 @@ impl eframe::App for RsyncStatApp {
         // egui margins are i8; keep ~5–9 px so focus rings clear panel edges.
         let panel_frame =
             egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(9, 7));
-        let central_frame =
-            egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(8));
+        // Same top margin as the side panel so the first row of buttons in
+        // every column starts on one line.
+        let central_frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin {
+            left: 8,
+            right: 8,
+            top: 7,
+            bottom: 8,
+        });
 
         egui::Panel::top("menu").frame(panel_frame).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                let r = if self.syncing {
-                    ui.push_id(keyboard::focus_egui_id(keyboard::FocusId::RunSync), |ui| {
-                        ui.add_enabled(
-                            !self.sync_stop_requested,
-                            egui::Button::new(if self.sync_stop_requested {
-                                "Stopping…"
-                            } else {
-                                "Stop"
-                            }),
-                        )
-                    })
-                    .inner
-                } else {
-                    ui.push_id(keyboard::focus_egui_id(keyboard::FocusId::RunSync), |ui| {
-                        ui.add_enabled(
-                            self.folders_idle(),
-                            egui::Button::new(keyboard::layout_job_for_label(
-                                ui,
-                                &keyboard::parse_access_label(keyboard::raw_label_for(
-                                    keyboard::FocusId::RunSync,
-                                )),
-                                show_mnemonic,
-                                egui::TextStyle::Button,
-                            )),
-                        )
-                    })
-                    .inner
-                };
-                self.paint_focus_if(ui, r.rect, keyboard::FocusId::RunSync);
-                if r.clicked() {
-                    self.kbd.focused = keyboard::FocusId::RunSync;
-                    if self.syncing {
-                        self.stop_sync();
-                    } else {
-                        self.start_sync();
-                    }
-                }
                 ui.weak(&self.sync_status);
             });
             if !self.mismatched_files.is_empty() {
@@ -237,20 +206,24 @@ impl eframe::App for RsyncStatApp {
             .default_size(280.0)
             .frame(panel_frame)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let r = keyboard::mnemonic_selectable(
-                        ui,
-                        keyboard::FocusId::TreeTabA,
-                        keyboard::raw_label_for(keyboard::FocusId::TreeTabA),
-                        active == ActivePane::Source,
-                        show_mnemonic,
-                    );
-                    self.paint_focus_if(ui, r.rect, keyboard::FocusId::TreeTabA);
-                    if r.clicked() {
-                        self.active_pane = ActivePane::Source;
-                        self.kbd.focused = keyboard::FocusId::TreeTabA;
+                ui.columns(3, |cols| {
+                    {
+                        let ui = &mut cols[0];
+                        let r = keyboard::mnemonic_selectable(
+                            ui,
+                            keyboard::FocusId::TreeTabA,
+                            keyboard::raw_label_for(keyboard::FocusId::TreeTabA),
+                            active == ActivePane::Source,
+                            show_mnemonic,
+                        );
+                        self.paint_focus_if(ui, r.rect, keyboard::FocusId::TreeTabA);
+                        if r.clicked() {
+                            self.active_pane = ActivePane::Source;
+                            self.kbd.focused = keyboard::FocusId::TreeTabA;
+                        }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    {
+                        let ui = &mut cols[1];
                         let r = keyboard::mnemonic_selectable(
                             ui,
                             keyboard::FocusId::TreeTabB,
@@ -263,7 +236,8 @@ impl eframe::App for RsyncStatApp {
                             self.active_pane = ActivePane::Target;
                             self.kbd.focused = keyboard::FocusId::TreeTabB;
                         }
-                    });
+                    }
+                    self.draw_run_sync_button(&mut cols[2], show_mnemonic);
                 });
                 ui.separator();
                 if active_scanning {
@@ -619,6 +593,51 @@ impl eframe::App for RsyncStatApp {
         }
         self.confirm_delete_modal(ui.ctx());
         self.save_preset_modal(ui.ctx());
+    }
+}
+
+impl RsyncStatApp {
+    fn draw_run_sync_button(&mut self, ui: &mut egui::Ui, show_mnemonic: bool) {
+        let size = Vec2::new(ui.available_width(), ui::CONTROL_HEIGHT);
+        let r = if self.syncing {
+            ui.push_id(keyboard::focus_egui_id(keyboard::FocusId::RunSync), |ui| {
+                ui.add_enabled(
+                    !self.sync_stop_requested,
+                    egui::Button::new(if self.sync_stop_requested {
+                        "Stopping…"
+                    } else {
+                        "Stop"
+                    })
+                    .min_size(size),
+                )
+            })
+            .inner
+        } else {
+            ui.push_id(keyboard::focus_egui_id(keyboard::FocusId::RunSync), |ui| {
+                ui.add_enabled(
+                    self.folders_idle(),
+                    egui::Button::new(keyboard::layout_job_for_label(
+                        ui,
+                        &keyboard::parse_access_label(keyboard::raw_label_for(
+                            keyboard::FocusId::RunSync,
+                        )),
+                        show_mnemonic,
+                        egui::TextStyle::Button,
+                    ))
+                    .min_size(size),
+                )
+            })
+            .inner
+        };
+        self.paint_focus_if(ui, r.rect, keyboard::FocusId::RunSync);
+        if r.clicked() {
+            self.kbd.focused = keyboard::FocusId::RunSync;
+            if self.syncing {
+                self.stop_sync();
+            } else {
+                self.start_sync();
+            }
+        }
     }
 }
 

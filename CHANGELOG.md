@@ -19,6 +19,9 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 - App icon, plus `scripts/make-icons.sh` to build PNG, ICO and ICNS files from one master PNG
 
 ### Changed
+- Source, Target and Run sync share one evenly spaced row; Tab order now runs row by row across the window (Run sync → Source… → Target… before the filters)
+- Source and Target tabs are framed toggles that match the other buttons in light and dark mode
+- The first row of buttons starts at the same height in the left panel and both panes
 - Sync logic moved out of the app into `rsyncstat-plan` and `rsyncstat-exec`
 - App split into `app/` and `ui/` modules
 - Byte formatting shared through `rsyncstat-model`

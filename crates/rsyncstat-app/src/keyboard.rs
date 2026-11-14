@@ -4,7 +4,7 @@
 
 use eframe::egui::{
     self, text::LayoutJob, Button, Event, Key, Modifiers, Rect, Response, RichText, Sense, Stroke,
-    StrokeKind, TextFormat, Ui,
+    StrokeKind, TextFormat, Ui, Vec2,
 };
 use std::collections::HashSet;
 
@@ -30,23 +30,29 @@ pub enum FocusId {
     TreemapB,
 }
 
-/// Left-to-right, top-to-bottom tab order matching the painted layout.
+/// Row by row, left to right, matching the painted layout: the top toolbar row
+/// across all three columns, then the pane button row, then the left panel
+/// body, then the treemaps.
 pub const TAB_ORDER: &[FocusId] = &[
-    FocusId::RunSync,
+    // Row 1: tree tabs, Run sync, then each pane's folder button.
     FocusId::TreeTabA,
     FocusId::TreeTabB,
+    FocusId::RunSync,
+    FocusId::PaneAChoose,
+    FocusId::PaneBChoose,
+    // Row 2: pane A and pane B action buttons.
+    FocusId::OpenSourceA,
+    FocusId::PaneARescan,
+    FocusId::OpenTargetB,
+    FocusId::PaneBRescan,
+    // Left panel body.
     FocusId::ExcludeTypes,
     FocusId::ExcludeDirs,
     FocusId::ApplyRescan,
     FocusId::DirectoryTree,
-    FocusId::PaneAChoose,
-    FocusId::OpenSourceA,
-    FocusId::PaneARescan,
+    // Treemaps and the splitter between them.
     FocusId::TreemapA,
     FocusId::Splitter,
-    FocusId::PaneBChoose,
-    FocusId::OpenTargetB,
-    FocusId::PaneBRescan,
     FocusId::TreemapB,
 ];
 
@@ -100,7 +106,7 @@ pub struct KeyboardState {
 impl Default for KeyboardState {
     fn default() -> Self {
         Self {
-            focused: FocusId::RunSync,
+            focused: FocusId::TreeTabA,
             help_open: false,
             pending: KeyAction::None,
         }
@@ -282,9 +288,14 @@ pub fn mnemonic_selectable(
 ) -> Response {
     let id = focus_egui_id(slot);
     let parsed = parse_access_label(raw_label);
-    let job = layout_job_for_label(ui, &parsed, show_underline, egui::TextStyle::Body);
-    ui.push_id(id, |ui| ui.selectable_label(selected, job))
-        .inner
+    let job = layout_job_for_label(ui, &parsed, show_underline, egui::TextStyle::Button);
+    let size = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
+    // A framed toggle: the idle tab keeps the normal button fill so it reads
+    // like its neighbours; the active tab uses the theme's selection colors.
+    ui.push_id(id, |ui| {
+        ui.add(Button::new(job).selected(selected).min_size(size))
+    })
+    .inner
 }
 
 /// Focus target over a rectangle that another widget will paint.
@@ -370,7 +381,7 @@ pub fn handle_frame_input(
         if input.key_pressed(Key::Tab) {
             // Drop the directory-tree slot when that pane has no scan yet.
             if !order.contains(&state.focused) {
-                state.focused = order.first().copied().unwrap_or(FocusId::RunSync);
+                state.focused = order.first().copied().unwrap_or(FocusId::TreeTabA);
             }
             let idx = order
                 .iter()
@@ -589,66 +600,58 @@ mod tests {
     }
 
     #[test]
-    fn focus_order_runs_toolbar_then_left_panel_then_pane_a_before_pane_b() {
+    fn focus_order_runs_row_by_row_across_the_window() {
         let dual = visible_tab_order(true);
-        let sync = dual.iter().position(|&id| id == FocusId::RunSync).unwrap();
-        let tree_a = dual.iter().position(|&id| id == FocusId::TreeTabA).unwrap();
-        let include = dual
-            .iter()
-            .position(|&id| id == FocusId::ExcludeTypes)
-            .unwrap();
-        let a_choose = dual
-            .iter()
-            .position(|&id| id == FocusId::PaneAChoose)
-            .unwrap();
-        let a_open = dual
-            .iter()
-            .position(|&id| id == FocusId::OpenSourceA)
-            .unwrap();
-        let a_map = dual.iter().position(|&id| id == FocusId::TreemapA).unwrap();
-        let b_choose = dual
-            .iter()
-            .position(|&id| id == FocusId::PaneBChoose)
-            .unwrap();
-        assert!(sync < tree_a);
-        assert!(tree_a < include);
-        assert!(include < a_choose);
-        assert!(a_choose < a_open);
-        assert!(a_open < a_map);
-        assert!(a_map < b_choose);
+        let pos = |id: FocusId| dual.iter().position(|&x| x == id).unwrap();
+        // Row 1 crosses every column before anything below it.
+        let row1 = [
+            FocusId::TreeTabA,
+            FocusId::TreeTabB,
+            FocusId::RunSync,
+            FocusId::PaneAChoose,
+            FocusId::PaneBChoose,
+        ];
+        let row2 = [
+            FocusId::OpenSourceA,
+            FocusId::PaneARescan,
+            FocusId::OpenTargetB,
+            FocusId::PaneBRescan,
+        ];
+        for pair in row1.windows(2).chain(row2.windows(2)) {
+            assert!(
+                pos(pair[0]) < pos(pair[1]),
+                "{:?} before {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert!(pos(FocusId::PaneBChoose) < pos(FocusId::OpenSourceA));
+        // Run sync goes right to the panes, not down into the filters.
+        assert_eq!(pos(FocusId::RunSync) + 1, pos(FocusId::PaneAChoose));
+        assert!(pos(FocusId::PaneBRescan) < pos(FocusId::ExcludeTypes));
+        assert!(pos(FocusId::ExcludeTypes) < pos(FocusId::DirectoryTree));
+        assert!(pos(FocusId::DirectoryTree) < pos(FocusId::TreemapA));
+        assert!(pos(FocusId::TreemapA) < pos(FocusId::Splitter));
+        assert!(pos(FocusId::Splitter) < pos(FocusId::TreemapB));
     }
 
     #[test]
-    fn tab_order_starts_with_sync_bar_and_follows_visual_layout() {
-        assert_eq!(TAB_ORDER[0], FocusId::RunSync);
-        assert_eq!(TAB_ORDER[1], FocusId::TreeTabA);
+    fn tab_order_starts_with_source_target_run_sync_and_follows_visual_layout() {
+        assert_eq!(TAB_ORDER[0], FocusId::TreeTabA);
+        assert_eq!(TAB_ORDER[1], FocusId::TreeTabB);
+        assert_eq!(TAB_ORDER[2], FocusId::RunSync);
         assert!(TAB_ORDER.contains(&FocusId::TreemapA));
         assert!(TAB_ORDER.contains(&FocusId::TreemapB));
         let dual = visible_tab_order(true);
         assert!(dual.contains(&FocusId::TreeTabB));
         assert!(dual.contains(&FocusId::OpenTargetB));
-        assert!(
-            dual.iter().position(|&a| a == FocusId::TreemapA)
-                < dual.iter().position(|&b| b == FocusId::PaneBChoose)
-        );
-        // Within a pane: Choose → Open → Rescan → Treemap
-        let a_choose = dual
-            .iter()
-            .position(|&id| id == FocusId::PaneAChoose)
-            .unwrap();
-        let a_open = dual
-            .iter()
-            .position(|&id| id == FocusId::OpenSourceA)
-            .unwrap();
-        let a_rescan = dual
-            .iter()
-            .position(|&id| id == FocusId::PaneARescan)
-            .unwrap();
-        let a_map = dual.iter().position(|&id| id == FocusId::TreemapA).unwrap();
-        assert_eq!(
-            (a_choose + 1, a_choose + 2, a_choose + 3),
-            (a_open, a_rescan, a_map)
-        );
+        // Each pane still reads Choose → Open → Rescan, with its treemap after
+        // the button rows.
+        let pos = |id: FocusId| dual.iter().position(|&x| x == id).unwrap();
+        assert!(pos(FocusId::PaneAChoose) < pos(FocusId::OpenSourceA));
+        assert_eq!(pos(FocusId::OpenSourceA) + 1, pos(FocusId::PaneARescan));
+        assert!(pos(FocusId::PaneARescan) < pos(FocusId::TreemapA));
+        assert_eq!(pos(FocusId::OpenTargetB) + 1, pos(FocusId::PaneBRescan));
     }
 
     #[test]
