@@ -14,10 +14,7 @@ impl RsyncStatApp {
         let (tx, rx) = unbounded();
         self.folder_pick = Some((pane, rx));
         let ctx = ctx.clone();
-        // The open panel runs a nested AppKit modal loop. Opening it from this
-        // click keeps winit's event handler on the stack, and resizing the panel
-        // then delivers another event into that handler and aborts the process.
-        // Run it on the next turn of the main queue, after the handler returns.
+        // Must not block this thread: see `run_after_event`.
         run_after_event(move || {
             let path = rfd::FileDialog::new().set_title(title).pick_folder();
             let _ = tx.send(path);

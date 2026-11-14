@@ -1,11 +1,19 @@
 //! Platform glue.
 
-/// Run `work` after the current window event has returned.
+/// Run `work` without blocking the window's event loop.
 ///
 /// On macOS the folder panel is a nested modal loop. Starting it from inside
 /// winit's event handler makes a resize of that panel re-enter the handler,
 /// which aborts. `dispatch_async` to the main queue runs only after this
-/// event returns. Other platforms show the dialog immediately.
+/// event returns.
+///
+/// On Linux, `rfd` waits on the XDG file-chooser portal until the dialog
+/// closes. Doing that on the UI thread stops Wayland ping replies, and
+/// Hyprland then opens its own dialog (`CANRManager` in `/usr/bin/Hyprland`,
+/// `misc:enable_anr_dialog`): "An application {title} - {class} is not
+/// responding." The portal call itself is D-Bus and does not need the UI
+/// thread, so it runs in the background. The result is delivered on the
+/// channel the caller already polls.
 pub(crate) fn run_after_event(work: impl FnOnce() + Send + 'static) {
     #[cfg(target_os = "macos")]
     {
@@ -18,7 +26,14 @@ pub(crate) fn run_after_event(work: impl FnOnce() + Send + 'static) {
             dispatch_async_f(main_queue(), ctx.cast(), call_after_event);
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        std::thread::Builder::new()
+            .name("folder-dialog".into())
+            .spawn(work)
+            .expect("spawn folder dialog thread");
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         work();
     }
