@@ -37,6 +37,15 @@ fn section_height(span: f32, fraction: f32) -> f32 {
     }
 }
 
+/// Smallest height the file types list gets before the information section above it.
+const TYPE_LIST_MIN_H: f32 = 36.0;
+
+/// Height the information section and its split bar may share once the file
+/// types section below has `types_min`.
+fn info_span_after_types(available: f32, types_min: f32) -> f32 {
+    (available - types_min).max(0.0)
+}
+
 impl eframe::App for RsyncStatApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_folder_pick(ctx);
@@ -435,8 +444,26 @@ impl eframe::App for RsyncStatApp {
                         self.tree_fraction = ((pos.y - files_top) / usable).clamp(0.12, 0.88);
                     }
                 }
+                // Size the information section from what is left after the file
+                // types section has its minimum. Otherwise the types heading and
+                // list spill past the panel and its edge line runs through the
+                // status bar.
+                let space_reserve = if space_tiles.is_empty() {
+                    0.0
+                } else {
+                    4.0 + 20.0 * space_tiles.len() as f32
+                };
+                let item_gap = ui.spacing().item_spacing.y;
+                let types_min = ui.text_style_height(&egui::TextStyle::Heading)
+                    + item_gap
+                    + if type_rows.is_empty() {
+                        0.0
+                    } else {
+                        TYPE_LIST_MIN_H + item_gap
+                    }
+                    + space_reserve;
                 let info_top = ui.cursor().min.y;
-                let info_span = ui.available_height();
+                let info_span = info_span_after_types(ui.available_height(), types_min);
                 let info_usable = (info_span - SECTION_BAR_H).max(1.0);
                 let info_h = section_height(info_span, self.info_fraction);
                 let (info_slot, _) = ui.allocate_exact_size(
@@ -488,12 +515,7 @@ impl eframe::App for RsyncStatApp {
                 }
                 ui.heading("File types");
                 if !type_rows.is_empty() {
-                    let reserve = if space_tiles.is_empty() {
-                        0.0
-                    } else {
-                        4.0 + 20.0 * space_tiles.len() as f32
-                    };
-                    let max_h = (ui.available_height() - reserve).max(36.0);
+                    let max_h = (ui.available_height() - space_reserve).max(TYPE_LIST_MIN_H);
                     egui::ScrollArea::vertical()
                         .id_salt("file-types")
                         .max_height(max_h)
@@ -660,4 +682,36 @@ fn space_summary(diff: &rsyncstat_plan::DirectoryDiff) -> String {
         format_bytes(diff.bytes_a),
         format_bytes(diff.bytes_b)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The information section, its split bar and the file types minimum must
+    /// fit in the space below the tree, or the left panel grows past the status
+    /// bar and its edge line runs through it.
+    #[test]
+    fn info_section_leaves_room_for_file_types() {
+        let types_min = 30.0 + TYPE_LIST_MIN_H;
+        for available in [40.0_f32, 120.0, 180.0, 400.0, 900.0] {
+            for fraction in [0.12_f32, 0.5, 0.88] {
+                let span = info_span_after_types(available, types_min);
+                let info_h = section_height(span, fraction);
+                let used = info_h + SECTION_BAR_H + types_min;
+                if available >= types_min + SECTION_BAR_H + 1.0 {
+                    assert!(
+                        used <= available + 0.5,
+                        "available {available}, fraction {fraction}: used {used}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn info_span_never_goes_negative() {
+        assert_eq!(info_span_after_types(20.0, 66.0), 0.0);
+        assert_eq!(info_span_after_types(166.0, 66.0), 100.0);
+    }
 }
