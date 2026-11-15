@@ -70,14 +70,17 @@ Disk visualizers show where the space goes but never move a byte. Two-way sync t
 
 ## Install
 
-### Arch Linux / Omarchy (AUR)
+### Arch Linux / Omarchy
+
+From a checkout:
 
 ```bash
-yay -S rsyncstat
-# or: paru -S rsyncstat
+cd pkgbuild && makepkg -fsi
 ```
 
-That installs the binary, desktop entry, and icon. Named include/exclude packs live in `~/.config/rsyncstat/include-exclude.yaml`. Packaging details: [docs/packaging.md](docs/packaging.md).
+AUR package `rsyncstat` is prepared (`pkgbuild/PKGBUILD.aur`) and will be
+`yay -S rsyncstat` once published — see [docs/packaging.md](docs/packaging.md).
+Named include/exclude packs live in `~/.config/rsyncstat/include-exclude.yaml`.
 
 ### From a git checkout
 

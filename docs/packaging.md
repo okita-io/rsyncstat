@@ -12,8 +12,29 @@ That uses `pkgbuild/PKGBUILD`, which builds the parent tree.
 
 ## AUR (`rsyncstat`)
 
-1. Tag and push a release (`v0.1.0`, …). GitHub Actions attaches platform archives.
-2. Checksum the source tarball:
+`v0.1.0` is tagged and public. `pkgbuild/PKGBUILD.aur` already has the release
+tarball checksum. A ready-to-push clone lives at `~/aur/rsyncstat` (PKGBUILD +
+`.SRCINFO`).
+
+**Blocked (2026-11-14):** AUR new-account registration is temporarily closed
+(HTTP 503). An SSH key was generated at `~/.ssh/aur` / `~/.ssh/aur.pub` for
+when registration reopens.
+
+When you have an AUR account:
+
+1. Paste `~/.ssh/aur.pub` into AUR → My Account → SSH Public Key.
+2. Push the prepared package:
+
+```bash
+cd ~/aur/rsyncstat
+ssh -T aur@aur.archlinux.org   # should greet you by username
+git push -u origin master
+```
+
+If the remote already has history (deleted package reuse), clone instead and
+copy `PKGBUILD` / `.SRCINFO` into that tree.
+
+To rebuild checksums for a later tag:
 
 ```bash
 VER=0.1.0
@@ -22,24 +43,7 @@ curl -sL -o /tmp/rsyncstat-$VER.tar.gz \
 sha256sum /tmp/rsyncstat-$VER.tar.gz
 ```
 
-3. Copy `pkgbuild/PKGBUILD.aur` into a fresh AUR clone and set `sha256sums`:
-
-```bash
-git -c init.defaultBranch=master clone ssh://aur@aur.archlinux.org/rsyncstat.git ~/aur/rsyncstat
-cp pkgbuild/PKGBUILD.aur ~/aur/rsyncstat/PKGBUILD
-# edit sha256sums, then:
-cd ~/aur/rsyncstat
-makepkg -f
-namcap PKGBUILD *.pkg.tar.zst
-makepkg --printsrcinfo > .SRCINFO
-git add PKGBUILD .SRCINFO
-git commit -m "rsyncstat $VER-1"
-git push
-```
-
-AUR account + SSH key for `aur.archlinux.org` are required (see the [AUR submission guidelines](https://wiki.archlinux.org/title/AUR_submission_guidelines)).
-
-Install for users:
+Install for users (after the AUR push):
 
 ```bash
 yay -S rsyncstat
@@ -49,11 +53,25 @@ paru -S rsyncstat
 
 ## Omarchy packages (after AUR)
 
-Once tagged releases exist on GitHub:
+Once the AUR package is live (or in parallel, using the same tarball):
 
-1. Open a PR on [`omacom/omarchy-pkgs`](https://github.com/omacom/omarchy-pkgs) under `pkgbuilds/rsyncstat/`.
-2. Build from the same release tarball as the AUR package (not a local checkout).
-3. Add `.omarchy/package.json` with `"source": "local"`, `"auto_merge": true`, and an `upstream.watch` on `okita-io/rsyncstat`.
+1. Fork/clone [`omacom/omarchy-pkgs`](https://github.com/omacom/omarchy-pkgs).
+2. Add `pkgbuilds/rsyncstat/` with a PKGBUILD matching `pkgbuild/PKGBUILD.aur`
+   (same `source` URL and `sha256sums`).
+3. Add `.omarchy/package.json`:
+
+```json
+{
+  "source": "local",
+  "auto_merge": true,
+  "upstream": {
+    "watch": "https://github.com/okita-io/rsyncstat"
+  }
+}
+```
+
+4. Open a PR. After merge, ask for install-list / migration wiring if you want
+   it on new Omarchy installs by default.
 
 ## Config file location
 

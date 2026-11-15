@@ -1,9 +1,5 @@
-# AUR package template. After tagging v$pkgver, fill sha256sums from:
-#   curl -sL -o /tmp/rsyncstat-$pkgver.tar.gz \
-#     https://github.com/okita-io/rsyncstat/archive/refs/tags/v$pkgver.tar.gz
-#   sha256sum /tmp/rsyncstat-$pkgver.tar.gz
-#
-# Publish steps: docs/packaging.md
+# AUR package for https://aur.archlinux.org/packages/rsyncstat
+# Publish steps: docs/packaging.md (ready-to-push tree: ~/aur/rsyncstat)
 pkgname=rsyncstat
 pkgver=0.1.0
 pkgrel=1
@@ -15,7 +11,7 @@ depends=('gtk3' 'libxkbcommon' 'wayland' 'xdg-desktop-portal' 'xdg-desktop-porta
 makedepends=('cargo' 'clang')
 options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('REPLACE_AFTER_TAG')
+sha256sums=('22eb48fa0f175455d195c2df3875025039296096e25e3cf53d207664ef760a11')
 
 prepare() {
   cd "$pkgname-$pkgver"
