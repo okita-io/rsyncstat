@@ -51,27 +51,16 @@ yay -S rsyncstat
 paru -S rsyncstat
 ```
 
-## Omarchy packages (after AUR)
+## Omarchy packages
 
-Once the AUR package is live (or in parallel, using the same tarball):
+Draft PR: [omacom/omarchy-pkgs#2792](https://github.com/omacom/omarchy-pkgs/pull/2792)
+(`pkgbuilds/rsyncstat`, same `v0.1.0` tarball and checksum as the AUR recipe).
 
-1. Fork/clone [`omacom/omarchy-pkgs`](https://github.com/omacom/omarchy-pkgs).
-2. Add `pkgbuilds/rsyncstat/` with a PKGBUILD matching `pkgbuild/PKGBUILD.aur`
-   (same `source` URL and `sha256sums`).
-3. Add `.omarchy/package.json`:
+Non-draft PRs that only touch `pkgbuilds/` auto-merge and publish to the `edge`
+channel when CI is green. Mark #2792 ready when you want that.
 
-```json
-{
-  "source": "local",
-  "auto_merge": true,
-  "upstream": {
-    "watch": "https://github.com/okita-io/rsyncstat"
-  }
-}
-```
-
-4. Open a PR. After merge, ask for install-list / migration wiring if you want
-   it on new Omarchy installs by default.
+After it lands on edge / stable, ask for install-list or migration wiring if
+you want it on new Omarchy installs by default.
 
 ## Config file location
 
