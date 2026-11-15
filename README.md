@@ -70,14 +70,16 @@ Disk visualizers show where the space goes but never move a byte. Two-way sync t
 
 ## Install
 
-There are no prebuilt releases yet. Build from source.
+### Arch Linux / Omarchy (AUR)
 
-### Prerequisites
+```bash
+yay -S rsyncstat
+# or: paru -S rsyncstat
+```
 
-- Rust **stable 1.95 or newer** (required by eframe/egui 0.37; see `rust-toolchain.toml`)
-- Platform libraries for the GUI (see [Platform notes](#platform-notes))
+That installs the binary, desktop entry, and icon. Named include/exclude packs live in `~/.config/rsyncstat/include-exclude.yaml`. Packaging details: [docs/packaging.md](docs/packaging.md).
 
-### Build and run
+### From a git checkout
 
 ```bash
 git clone https://github.com/okita-io/rsyncstat
@@ -85,7 +87,12 @@ cd rsyncstat
 cargo run --release -p rsyncstat-app
 ```
 
-The release binary is `target/release/rsyncstat` (`rsyncstat.exe` on Windows, with the app icon embedded). Use **Open folder…** to pick a root.
+On Arch, `cd pkgbuild && makepkg -fsi` installs the local tree as a package. The release binary is `target/release/rsyncstat` (`rsyncstat.exe` on Windows, with the app icon embedded).
+
+### Prerequisites
+
+- Rust **stable 1.95 or newer** (required by eframe/egui 0.37; see `rust-toolchain.toml`)
+- Platform libraries for the GUI (see [Platform notes](#platform-notes))
 
 ### macOS app bundle
 
@@ -161,11 +168,15 @@ CI runs on Ubuntu, macOS and Windows. See [CONTRIBUTING.md](CONTRIBUTING.md) bef
 
 ### Linux (including Arch / Omarchy / Hyprland)
 
-Arch:
+On Omarchy, the window follows `~/.local/state/omarchy/current/theme/colors.toml` and reloads when you switch themes. Background, foreground, selection, muted, accent, and the red/yellow status colors land on the egui chrome (buttons, fields, focus rings, warnings). On Hyprland, those corners follow `decoration:rounding` and update about once a second. Treemap file colors stay the deterministic per-extension palette. With no theme file, the app keeps the default egui dark theme and the Omarchy accent `#FFD60A`. Off Hyprland the corners stay at 4 px. Set `RSYNCSTAT_OMARCHY_THEME_DIR` to a directory that contains `theme/colors.toml` to point at a different palette.
+
+Arch build dependencies for a source build:
 
 ```bash
-sudo pacman -S --needed base-devel pkgconf gtk3 libxkbcommon wayland
+sudo pacman -S --needed base-devel pkgconf gtk3 libxkbcommon wayland xdg-desktop-portal xdg-desktop-portal-gtk
 ```
+
+The Wayland app id and desktop `StartupWMClass` are both `rsyncstat`, so the launcher icon attaches correctly.
 
 Debian/Ubuntu:
 

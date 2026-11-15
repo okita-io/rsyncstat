@@ -1,0 +1,29 @@
+# Local convenience package: builds from the parent git checkout.
+# For the public AUR package (release tarball + checksums), see docs/packaging.md.
+pkgname=rsyncstat
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Disk-usage treemap and safe folder sync'
+url='https://github.com/okita-io/rsyncstat'
+arch=('x86_64' 'aarch64')
+license=('MIT')
+depends=('gtk3' 'libxkbcommon' 'wayland' 'xdg-desktop-portal' 'xdg-desktop-portal-gtk')
+makedepends=('cargo' 'clang')
+options=('!lto')
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir/.."
+  cargo build --release --locked -p rsyncstat-app
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 target/release/rsyncstat "$pkgdir/usr/bin/rsyncstat"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 crates/rsyncstat-app/assets/icon.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/rsyncstat.png"
+  install -Dm644 "$startdir/rsyncstat.desktop" \
+    "$pkgdir/usr/share/applications/rsyncstat.desktop"
+}

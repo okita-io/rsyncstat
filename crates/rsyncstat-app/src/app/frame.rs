@@ -11,9 +11,9 @@ fn section_split(ui: &mut egui::Ui, tip: &str) -> egui::Response {
         Sense::click_and_drag(),
     );
     let stroke_color = if split_resp.dragged() || split_resp.hovered() {
-        egui::Color32::from_rgb(120, 150, 220)
+        ui.visuals().selection.stroke.color
     } else {
-        egui::Color32::from_gray(80)
+        ui.visuals().widgets.noninteractive.bg_stroke.color
     };
     ui.painter().hline(
         split_rect.x_range(),
@@ -48,6 +48,11 @@ fn info_span_after_types(available: f32, types_min: f32) -> f32 {
 
 impl eframe::App for RsyncStatApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.theme.poll() {
+            self.theme.apply(ctx);
+        }
+        // Idle windows still wake so a theme switch shows up without a click.
+        ctx.request_repaint_after(crate::omarchy_theme::POLL_INTERVAL);
         self.poll_folder_pick(ctx);
         self.poll_scans(ctx);
         let has_directory_tree = self.pane(self.active_pane).tree.is_some();
@@ -81,8 +86,11 @@ impl eframe::App for RsyncStatApp {
         // Menus, dialogs and popups read the context style, not this panel's.
         ui.ctx().all_styles_mut(|style| {
             style.spacing.interact_size.y = ui::CONTROL_HEIGHT;
-            let radius = egui::CornerRadius::same(ui::CONTROL_RADIUS);
+            let radius = egui::CornerRadius::same(self.theme.corner_radius());
+            style.visuals.window_corner_radius = radius;
+            style.visuals.menu_corner_radius = radius;
             let widgets = &mut style.visuals.widgets;
+            widgets.noninteractive.corner_radius = radius;
             widgets.inactive.corner_radius = radius;
             widgets.hovered.corner_radius = radius;
             widgets.active.corner_radius = radius;
@@ -364,7 +372,7 @@ impl eframe::App for RsyncStatApp {
                     ui.label(
                         egui::RichText::new(&self.pattern_warning)
                             .small()
-                            .color(egui::Color32::from_rgb(240, 170, 60)),
+                            .color(ui.visuals().warn_fg_color),
                     );
                 }
                 ui.separator();
@@ -559,9 +567,9 @@ impl eframe::App for RsyncStatApp {
                         Sense::click_and_drag(),
                     );
                     let stroke_color = if split_resp.dragged() || split_resp.hovered() {
-                        egui::Color32::from_rgb(120, 150, 220)
+                        ui.visuals().selection.stroke.color
                     } else {
-                        egui::Color32::from_gray(80)
+                        ui.visuals().widgets.noninteractive.bg_stroke.color
                     };
                     ui.painter().vline(
                         split_rect.center().x,
@@ -579,16 +587,6 @@ impl eframe::App for RsyncStatApp {
                     if split_resp.clicked() || split_resp.drag_started() {
                         self.kbd.focused = keyboard::FocusId::Splitter;
                     }
-                    if keyboard::is_focused(&self.kbd, keyboard::FocusId::Splitter) {
-                        let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(150, 200, 255));
-                        ui.painter().rect_stroke(
-                            split_rect.expand(1.0),
-                            2.0,
-                            stroke,
-                            egui::StrokeKind::Outside,
-                        );
-                    }
-
                     // Gaps between the panes and the splitter are not part of
                     // `total_w`. Taking the width still free keeps the target
                     // toolbar inside the window.

@@ -258,12 +258,9 @@ pub fn paint_focus_ring(ui: &Ui, rect: Rect, focused: bool) {
     let painter = ui
         .painter()
         .with_clip_rect(ui.clip_rect().expand(FOCUS_RING_OUTSET + FOCUS_PAD));
-    painter.rect_stroke(
-        rect.expand(FOCUS_RING_OUTSET / 2.0),
-        4.0,
-        stroke,
-        StrokeKind::Outside,
-    );
+    let expand = FOCUS_RING_OUTSET / 2.0;
+    let radius = f32::from(crate::ui::chrome_radius(ui.visuals())) + expand;
+    painter.rect_stroke(rect.expand(expand), radius, stroke, StrokeKind::Outside);
 }
 
 pub fn mnemonic_button(

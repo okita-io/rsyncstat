@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=RSyncStat
+Comment=Disk-usage treemap and safe folder sync
+Exec=rsyncstat
+Icon=rsyncstat
+Terminal=false
+Categories=Utility;Filesystem;
+StartupWMClass=rsyncstat

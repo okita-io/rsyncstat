@@ -1,4 +1,8 @@
-//! Load and save `include-exclude.yaml` next to the RSyncStat binary.
+//! Load and save `include-exclude.yaml` under the user config directory.
+//!
+//! Packaged installs live in `/usr/bin`, so the file cannot sit beside the
+//! binary. A portable copy next to the executable is still used when that
+//! file already exists.
 
 use rsyncstat_filter::{
     builtin_named_presets, builtin_preset_yaml, parse_preset_file, serialize_preset_file,
@@ -9,19 +13,47 @@ use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "include-exclude.yaml";
 
-/// `include-exclude.yaml` beside the running binary.
+/// Prefer an existing portable file beside the binary; otherwise use
+/// `$XDG_CONFIG_HOME/rsyncstat/` (or the platform equivalent).
 pub fn default_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            let mut dir = exe;
-            if dir.pop() {
-                Some(dir.join(FILE_NAME))
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| std::env::temp_dir().join(FILE_NAME))
+    resolve_path(exe_sibling(), user_config_dir())
+}
+
+fn resolve_path(beside: Option<PathBuf>, config_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(beside) = beside.as_ref() {
+        if beside.is_file() {
+            return beside.clone();
+        }
+    }
+    if let Some(dir) = config_dir {
+        return dir.join("rsyncstat").join(FILE_NAME);
+    }
+    if let Some(beside) = beside {
+        return beside;
+    }
+    std::env::temp_dir().join(FILE_NAME)
+}
+
+fn exe_sibling() -> Option<PathBuf> {
+    let mut dir = std::env::current_exe().ok()?;
+    if !dir.pop() {
+        return None;
+    }
+    Some(dir.join(FILE_NAME))
+}
+
+fn user_config_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(xdg));
+        }
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+    }
 }
 
 /// Read the file, or write the built-in packs if it is missing.
@@ -112,6 +144,27 @@ mod tests {
         assert_eq!(
             default_path().file_name().and_then(|name| name.to_str()),
             Some(FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn resolve_path_prefers_config_dir_when_no_portable_file() {
+        let dir = Sandbox::new("xdg");
+        let expected = dir.0.join("rsyncstat").join(FILE_NAME);
+        assert_eq!(
+            resolve_path(Some(dir.0.join(FILE_NAME)), Some(dir.0.clone())),
+            expected
+        );
+    }
+
+    #[test]
+    fn resolve_path_keeps_an_existing_portable_file() {
+        let dir = Sandbox::new("portable");
+        let beside = dir.yaml();
+        fs::write(&beside, "presets: []\n").unwrap();
+        assert_eq!(
+            resolve_path(Some(beside.clone()), Some(dir.0.join("elsewhere"))),
+            beside
         );
     }
 

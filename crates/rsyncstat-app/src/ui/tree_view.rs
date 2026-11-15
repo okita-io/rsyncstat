@@ -164,7 +164,7 @@ pub(super) fn paint_tree_row(
         ui.painter().rect_stroke(
             response.rect.expand(1.0),
             2.0,
-            Stroke::new(1.5, Color32::from_rgb(255, 210, 80)),
+            Stroke::new(1.5, ui.visuals().selection.stroke.color),
             StrokeKind::Outside,
         );
     }
@@ -228,7 +228,7 @@ pub fn live_directories(
                     ui.label(
                         egui::RichText::new(format!("▸ {line}"))
                             .strong()
-                            .color(Color32::from_rgb(150, 200, 255)),
+                            .color(ui.visuals().hyperlink_color),
                     );
                 } else {
                     ui.label(egui::RichText::new(line).small().weak());

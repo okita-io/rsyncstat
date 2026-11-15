@@ -43,6 +43,7 @@ pub fn run() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_title("RSyncStat")
+            .with_app_id("rsyncstat")
             .with_icon(app_icon()),
         // Quantized tile colors sit on whole 8-bit values. This keeps the GPU
         // pass from smoothing the in-between samples of the file-map dither.
@@ -84,7 +85,7 @@ struct RsyncStatApp {
     pattern_warning: String,
     /// Built-in excludes such as `.DS_Store`, `node_modules`, and `target`.
     use_preset_excludes: bool,
-    /// Named packs from `include-exclude.yaml` next to the binary.
+    /// Named packs from `include-exclude.yaml` under the user config directory.
     named_presets: Vec<NamedPreset>,
     preset_file: PathBuf,
     /// Open "Save preset" dialog; the string is the name being typed.
@@ -113,6 +114,8 @@ struct RsyncStatApp {
     /// File or folder the user asked to delete. The dialog confirms it.
     confirm_delete: Option<PendingDelete>,
     kbd: keyboard::KeyboardState,
+    /// Omarchy `colors.toml`, re-read while the window is open.
+    theme: crate::omarchy_theme::ThemeSource,
 }
 
 #[derive(Clone)]
@@ -123,7 +126,9 @@ struct PendingDelete {
 }
 
 impl RsyncStatApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let theme = crate::omarchy_theme::ThemeSource::live();
+        theme.apply(&cc.egui_ctx);
         let preset_file = presets::default_path();
         let (named_presets, preset_notice) = presets::load_or_create(&preset_file);
         let pattern_warning = preset_notice.unwrap_or_default();
@@ -162,6 +167,7 @@ impl RsyncStatApp {
             folder_pick: None,
             confirm_delete: None,
             kbd: keyboard::KeyboardState::default(),
+            theme,
         }
     }
 }

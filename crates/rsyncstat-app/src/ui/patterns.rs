@@ -25,8 +25,14 @@ pub struct PatternEditResult {
 
 /// Height shared by every button, text field and checkbox row.
 pub const CONTROL_HEIGHT: f32 = 30.0;
-/// Corner radius shared by buttons and text fields.
+/// Corner radius shared by buttons and text fields when Hyprland rounding
+/// is unavailable. On Hyprland this is replaced by `decoration:rounding`.
 pub const CONTROL_RADIUS: u8 = 4;
+
+/// Radius of buttons and custom fields for the active visuals.
+pub fn chrome_radius(visuals: &egui::Visuals) -> u8 {
+    visuals.widgets.inactive.corner_radius.nw
+}
 /// Inner padding for custom-painted text fields. Left is larger so glyphs
 /// do not sit on the stroke. Used on the frame because `.margin()` is ignored
 /// when `Frame::NONE` is set.
@@ -56,34 +62,24 @@ pub struct FieldColors {
 }
 
 impl FieldColors {
+    /// Pulls field chrome from the active visuals, so an Omarchy theme change
+    /// recolors the pattern editors on the next frame.
     pub fn for_visuals(visuals: &egui::Visuals) -> Self {
-        let g = Color32::from_gray;
-        if visuals.dark_mode {
-            Self {
-                label: g(204),
-                fill: g(60),
-                border: g(78),
-                divider: g(90),
-                toggle_on: g(92),
-                toggle_hover: g(74),
-                icon: g(176),
-                icon_hover: g(235),
-                toggle_text: g(150),
-                toggle_text_active: g(235),
-            }
-        } else {
-            Self {
-                label: g(70),
-                fill: g(255),
-                border: g(190),
-                divider: g(205),
-                toggle_on: g(214),
-                toggle_hover: g(232),
-                icon: g(100),
-                icon_hover: g(20),
-                toggle_text: g(110),
-                toggle_text_active: g(20),
-            }
+        let text = visuals.text_color();
+        let weak = visuals.weak_text_color();
+        Self {
+            label: text,
+            fill: visuals
+                .text_edit_bg_color
+                .unwrap_or(visuals.extreme_bg_color),
+            border: visuals.widgets.noninteractive.bg_stroke.color,
+            divider: visuals.widgets.noninteractive.bg_stroke.color,
+            toggle_on: visuals.selection.bg_fill,
+            toggle_hover: visuals.widgets.hovered.bg_fill,
+            icon: weak,
+            icon_hover: text,
+            toggle_text: weak,
+            toggle_text_active: text,
         }
     }
 }
@@ -118,11 +114,11 @@ pub fn pattern_edit(
         ui.add_space(inset);
         let width = (ui.available_width() - inset).max(32.0);
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, CONTROL_HEIGHT), Sense::hover());
-        ui.painter()
-            .rect_filled(rect, f32::from(CONTROL_RADIUS), colors.fill);
+        let radius = f32::from(chrome_radius(ui.visuals()));
+        ui.painter().rect_filled(rect, radius, colors.fill);
         ui.painter().rect_stroke(
             rect,
-            f32::from(CONTROL_RADIUS),
+            radius,
             Stroke::new(1.0, colors.border),
             StrokeKind::Inside,
         );
@@ -248,7 +244,7 @@ pub fn save_preset_dialog(
     let response = egui::Modal::new(egui::Id::unique("save_preset")).show(ctx, |ui| {
         ui.set_min_width(320.0);
         ui.heading("Save preset");
-        ui.label("Name this include/exclude pack. It is stored in include-exclude.yaml next to RSyncStat.");
+        ui.label("Name this include/exclude pack. It is stored in include-exclude.yaml under your config directory.");
         ui.add_space(8.0);
         let edit = ui.add(
             egui::TextEdit::singleline(name)
@@ -265,7 +261,7 @@ pub fn save_preset_dialog(
             ui.label(
                 egui::RichText::new(error)
                     .small()
-                    .color(Color32::from_rgb(240, 170, 60)),
+                    .color(ui.visuals().warn_fg_color),
             );
         }
         ui.add_space(8.0);

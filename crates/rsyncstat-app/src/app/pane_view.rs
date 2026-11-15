@@ -58,11 +58,11 @@ impl RsyncStatApp {
                 egui::Vec2::new(ui.available_width(), ui::CONTROL_HEIGHT),
                 egui::Sense::hover(),
             );
-            ui.painter()
-                .rect_filled(field, f32::from(ui::CONTROL_RADIUS), colors.fill);
+            let radius = f32::from(ui::chrome_radius(ui.visuals()));
+            ui.painter().rect_filled(field, radius, colors.fill);
             ui.painter().rect_stroke(
                 field,
-                f32::from(ui::CONTROL_RADIUS),
+                radius,
                 egui::Stroke::new(1.0, colors.border),
                 egui::StrokeKind::Inside,
             );
