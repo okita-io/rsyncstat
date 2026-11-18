@@ -4,6 +4,9 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 
 ## [Unreleased]
 
+### Fixed
+- The left column keeps its width while a scan lists long file names. Directory tree rows and the live scan list ellipsize inside the column, and the full line stays on hover
+
 ## [0.1.0] - 2026-11-14
 
 ### Added
