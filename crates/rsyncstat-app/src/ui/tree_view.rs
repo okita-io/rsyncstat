@@ -38,14 +38,22 @@ pub fn tree_view_with_path(
         _ => {}
     }
 
-    let clip = ui.clip_rect().size();
-    let min_width = if clip.x.is_finite() {
-        clip.x.max(80.0)
-    } else {
-        280.0
+    // The tree remembers the widest row and allocates that on its parent.
+    // The clip rect can be the whole window, so a long name would become the
+    // column's minimum and push the left edge right. Stay inside the width
+    // this column was given.
+    let allotted = ui.max_rect().width();
+    let visible = ui.clip_rect().width();
+    let column = match (allotted.is_finite(), visible.is_finite()) {
+        (true, true) => allotted.min(visible),
+        (true, false) => allotted,
+        (false, true) => visible,
+        (false, false) => 280.0,
     };
-    let min_height = if clip.y.is_finite() {
-        clip.y.clamp(0.0, 8_000.0)
+    let min_width = column.max(80.0);
+    let clip_h = ui.clip_rect().height();
+    let min_height = if clip_h.is_finite() {
+        clip_h.clamp(0.0, 8_000.0)
     } else {
         0.0
     };
@@ -55,6 +63,7 @@ pub fn tree_view_with_path(
         .fill_available_width(false)
         .fill_available_height(false)
         .min_width(min_width)
+        .max_width(min_width)
         .min_height(min_height)
         .row_layout(RowLayout::Compact)
         .override_striped(Some(false))
@@ -156,7 +165,8 @@ pub(super) fn paint_tree_row(
     } else if label.excluded {
         text = text.strikethrough().color(ui.visuals().weak_text_color());
     }
-    let response = ui.add(egui::Label::new(text).selectable(false));
+    // Ellipsize inside the row. Hover still shows the full line when it is cut.
+    let response = ui.add(egui::Label::new(text).selectable(false).truncate());
     if response.hovered() || pointer_on_row(ui, response.rect) {
         *hover = Some(path.to_vec());
     }
@@ -224,15 +234,16 @@ pub fn live_directories(
                     format_size(node.map(|n| n.size).unwrap_or(0))
                 };
                 let line = format!("{rel}  {detail}");
-                if i == 0 {
-                    ui.label(
-                        egui::RichText::new(format!("▸ {line}"))
-                            .strong()
-                            .color(ui.visuals().hyperlink_color),
-                    );
+                // Same rule as the directory tree: a path has no spaces, so an
+                // unwrapped label would become the column's minimum width.
+                let text = if i == 0 {
+                    egui::RichText::new(format!("▸ {line}"))
+                        .strong()
+                        .color(ui.visuals().hyperlink_color)
                 } else {
-                    ui.label(egui::RichText::new(line).small().weak());
-                }
+                    egui::RichText::new(line).small().weak()
+                };
+                ui.add(egui::Label::new(text).truncate());
             }
         });
 }
@@ -263,4 +274,114 @@ pub fn scan_status_line(ui: &mut egui::Ui, label: &str, path: Option<&PathBuf>) 
         let resp = ui.label(egui::RichText::new(shown).monospace());
         resp.on_hover_text(full);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn long_file_tree() -> TreeNode {
+        let mut root = TreeNode::new_dir("stories");
+        root.children
+            .push(TreeNode::file("component_".repeat(40), 12));
+        root
+    }
+
+    /// The directory tree used to adopt the widest row. A long name then became
+    /// the minimum width of whatever column held the tree.
+    #[test]
+    fn long_file_names_do_not_widen_the_directory_tree() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0));
+        let root = long_file_tree();
+        let mut selected = None;
+        let mut hover = None;
+        let mut widths = Vec::new();
+        for step in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(f64::from(step) / 60.0),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                let (slot, _) = ui.allocate_exact_size(Vec2::new(280.0, 220.0), Sense::hover());
+                let inner = ui.scope_builder(egui::UiBuilder::new().max_rect(slot), |ui| {
+                    tree_view_with_path(
+                        ui,
+                        &root,
+                        &["stories".to_string()],
+                        &mut selected,
+                        &mut hover,
+                        None,
+                        None,
+                    );
+                });
+                widths.push(inner.response.rect.width());
+            });
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            widths.iter().all(|width| *width <= 280.0 + 4.0),
+            "directory tree widened its column across frames: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn scanning_paths_do_not_widen_the_left_panel() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0));
+        let mut recent = VecDeque::new();
+        recent.push_front(format!(
+            "projects/{}/src/{}/very_long_file_name.rs",
+            "component_".repeat(16),
+            "module_".repeat(12),
+        ));
+        let root = long_file_tree();
+        let mut widths = Vec::new();
+        for step in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(f64::from(step) / 60.0),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                let panel = egui::Panel::left("tree_panel")
+                    .resizable(true)
+                    .default_size(280.0)
+                    .show(ui, |ui| {
+                        live_directories(ui, Some(&root), &recent, 40, 12, 80.0);
+                        ui.separator();
+                        let (slot, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 160.0),
+                            Sense::hover(),
+                        );
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(slot), |ui| {
+                            egui::ScrollArea::both()
+                                .id_salt("directory-tree")
+                                .auto_shrink([false, false])
+                                .max_height(ui.available_height())
+                                .show(ui, |ui| {
+                                    let mut selected = None;
+                                    let mut hover = None;
+                                    tree_view_with_path(
+                                        ui,
+                                        &root,
+                                        &["stories".to_string()],
+                                        &mut selected,
+                                        &mut hover,
+                                        None,
+                                        None,
+                                    );
+                                });
+                        });
+                    });
+                widths.push(panel.response.rect.width());
+            });
+            output.drop_without_applying_deltas();
+        }
+        assert!(
+            widths.iter().all(|width| *width <= 280.0 + 4.0),
+            "left panel grew across frames: {widths:?}"
+        );
+    }
 }
